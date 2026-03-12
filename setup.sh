@@ -363,7 +363,7 @@ echo "Phase 4: Setting up GitOps pipeline (Gitea + ArgoCD)..."
 # Wait for Gitea to be ready
 echo "  Waiting for Gitea..."
 ELAPSED=0
-until kubectl get pods -n gitea -l app.kubernetes.io/name=gitea -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q Running; do
+until kubectl get pods -n gitea -l app=gitea -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q Running; do
     if [ $ELAPSED -ge 300 ]; then
         echo "Error: Gitea not ready after 300s"
         exit 1
