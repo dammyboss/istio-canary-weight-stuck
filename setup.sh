@@ -396,7 +396,7 @@ until kubectl get pods -n gitea -l app=gitea -o jsonpath='{.items[0].status.phas
 done
 # Wait for Gitea HTTP to actually respond
 ELAPSED=0
-until curl -sf -o /dev/null http://gitea.devops.local. 2>/dev/null; do
+until curl -sf -o /dev/null http://gitea.devops.local:3000/ 2>/dev/null; do
     if [ $ELAPSED -ge 120 ]; then
         echo "Error: Gitea HTTP not responding after 120s"
         exit 1
@@ -417,7 +417,7 @@ except: print('password')
 " 2>/dev/null)
 GITEA_PASS_ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${GITEA_PASS}', safe=''))")
 GITEA_CRED="root:${GITEA_PASS_ENC}"
-GITEA_API="http://${GITEA_CRED}@gitea.devops.local./api/v1"
+GITEA_API="http://${GITEA_CRED}@gitea.devops.local:3000/api/v1"
 
 echo "  Gitea credentials retrieved"
 
@@ -433,7 +433,7 @@ sleep 3
 # Clone and populate the repo with broken manifests
 TMPDIR=$(mktemp -d)
 cd "$TMPDIR"
-git clone "http://${GITEA_CRED}@gitea.devops.local./root/bleater-istio-config.git" repo 2>/dev/null
+git clone "http://${GITEA_CRED}@gitea.devops.local:3000/root/bleater-istio-config.git" repo 2>/dev/null
 cd repo
 
 git config user.email "platform-team@bleater.dev"
