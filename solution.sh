@@ -319,22 +319,23 @@ echo ""
 
 echo "Step 9: Generating traffic for Prometheus metrics..."
 
-# Get the service cluster IP or use service name
+# Generate traffic by exec-ing into an existing mesh pod (no external images needed)
 SVC_URL="${STABLE_APP_LABEL}.${NS}.svc.cluster.local"
+EXEC_POD=$(sudo kubectl get pods -n "$NS" -l app=${STABLE_APP_LABEL},version=stable \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 
-# Generate traffic from a pod inside the cluster
-sudo kubectl run traffic-generator --rm -i --restart=Never -n "$NS" \
-    --image=curlimages/curl:latest \
-    --timeout=120s \
-    -- sh -c "
+if [ -n "$EXEC_POD" ]; then
+    sudo kubectl exec "$EXEC_POD" -n "$NS" -- sh -c "
         for i in \$(seq 1 300); do
-            curl -sf -o /dev/null -w '%{http_code}\n' http://${SVC_URL}:8080/ 2>/dev/null || true
-            sleep 0.2
+            wget -q -O /dev/null -T 2 http://${SVC_URL}:8080/ 2>/dev/null || \
+            curl -sf -o /dev/null -m 2 http://${SVC_URL}:8080/ 2>/dev/null || true
         done
         echo 'Traffic generation complete'
     " 2>/dev/null &
-
-echo "  Traffic generator running in background (300 requests)"
+    echo "  Traffic generator running in background via exec (300 requests)"
+else
+    echo "  Warning: No stable pod found for traffic generation"
+fi
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════
