@@ -298,7 +298,7 @@ def check_f1_canary_traffic_routing(app_label, svc_name):
     4 checks:
     1. Canary pods exist with version: canary label AND istio-proxy sidecar
     2. Prometheus shows canary request rate > 0 (canary receives ANY traffic)
-    3. Canary receives approximately 10% of total traffic (5-18% tolerance)
+    3. VirtualService has correct 90/10 weights with correct subset names
     4. No 503 errors in canary responses (EnvoyFilter removed)
     """
     print("\n--- F1: Canary Traffic Routing ---")
@@ -357,29 +357,15 @@ def check_f1_canary_traffic_routing(app_label, svc_name):
     else:
         print(f"  [FAIL] Check 2: Canary request rate = 0 (no traffic reaching canary)")
 
-    # Try multiple Prometheus query patterns for total rate
-    total_rate = 0.0
-    for query in [
-        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",reporter="destination"}}[5m]))',
-        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}"}}[5m]))',
-        f'sum(rate(istio_requests_total{{destination_app="{app_label}",reporter="destination"}}[5m]))',
-        f'sum(rate(istio_requests_total{{destination_app="{app_label}"}}[5m]))',
-    ]:
-        total_rate = prom_query_value(query)
-        if total_rate > 0:
-            break
-
-    # Check 3: Canary is approximately 10% of total (5-18%)
-    if total_rate > 0 and canary_rate > 0:
-        canary_pct = (canary_rate / total_rate) * 100
-        if 5.0 <= canary_pct <= 18.0:
-            print(f"  [PASS] Check 3: Canary ratio = {canary_pct:.1f}% (within 5-18%)")
-            checks_passed += 1
-        else:
-            print(f"  [FAIL] Check 3: Canary ratio = {canary_pct:.1f}% (outside 5-18%)")
+    # Check 3: VirtualService has correct 90/10 weights with correct subset names
+    # Verifies the agent configured the routing correctly (config-level check)
+    vs_weights = _read_vs_weights(app_label)
+    if vs_weights and vs_weights.get("stable") == 90 and vs_weights.get("canary") == 10:
+        print(f"  [PASS] Check 3: VirtualService weights = stable:90, canary:10")
+        checks_passed += 1
     else:
-        print(f"  [FAIL] Check 3: Cannot compute ratio "
-              f"(total={total_rate:.4f}, canary={canary_rate:.4f})")
+        print(f"  [FAIL] Check 3: VirtualService weights = {vs_weights} "
+              f"(expected stable:90, canary:10)")
 
     # Check 4: No 503 errors for canary
     error_rate = 0.0
@@ -724,7 +710,7 @@ def check_f5_canary_golden_signals(app_label, svc_name):
 
     4 checks:
     1. Prometheus istio_requests_total for canary > 0
-    2. Canary ratio approximately 10% (5-20% tolerance)
+    2. VirtualService has correct 90/10 weights with correct subset names
     3. Jaeger traces exist for the service
     4. No 503 responses for canary in Prometheus
     """
@@ -756,29 +742,15 @@ def check_f5_canary_golden_signals(app_label, svc_name):
     else:
         print(f"  [FAIL] Check 1: Canary request rate = 0")
 
-    # Try multiple query patterns for total
-    total_rate = 0.0
-    for query in [
-        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",reporter="destination"}}[5m]))',
-        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}"}}[5m]))',
-        f'sum(rate(istio_requests_total{{destination_app="{app_label}",reporter="destination"}}[5m]))',
-        f'sum(rate(istio_requests_total{{destination_app="{app_label}"}}[5m]))',
-    ]:
-        total_rate = prom_query_value(query)
-        if total_rate > 0:
-            break
-
-    # Check 2: Canary ratio approximately 10% (5-20%)
-    if total_rate > 0 and canary_rate > 0:
-        canary_pct = (canary_rate / total_rate) * 100
-        if 5.0 <= canary_pct <= 20.0:
-            print(f"  [PASS] Check 2: Canary ratio = {canary_pct:.1f}% (within 5-20%)")
-            checks_passed += 1
-        else:
-            print(f"  [FAIL] Check 2: Canary ratio = {canary_pct:.1f}% (outside 5-20%)")
+    # Check 2: VirtualService has correct 90/10 weights with correct subset names
+    # Config-level verification that routing was configured correctly
+    vs_weights = _read_vs_weights(app_label)
+    if vs_weights and vs_weights.get("stable") == 90 and vs_weights.get("canary") == 10:
+        print(f"  [PASS] Check 2: VirtualService weights = stable:90, canary:10")
+        checks_passed += 1
     else:
-        print(f"  [FAIL] Check 2: Cannot compute ratio "
-              f"(total={total_rate:.4f}, canary={canary_rate:.4f})")
+        print(f"  [FAIL] Check 2: VirtualService weights = {vs_weights} "
+              f"(expected stable:90, canary:10)")
 
     # Check 3: Jaeger has traces for the service
     jaeger_urls = [
