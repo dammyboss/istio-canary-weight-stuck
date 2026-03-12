@@ -886,6 +886,9 @@ done
 echo "  Mattermost ready"
 
 # Try to post messages to Mattermost for the fake incident thread
+# Wrap in subshell so failures don't kill setup
+(
+set +e
 
 # Get Mattermost credentials
 MM_PASS=$(python3 -c "
@@ -955,6 +958,7 @@ else
     echo "  R5: Could not login to Mattermost (non-critical)"
 fi
 echo ""
+) # end Mattermost subshell
 
 # ══════════════════════════════════════════════════════════════════════════
 # PHASE 9: DECOY HPA (R5b)
