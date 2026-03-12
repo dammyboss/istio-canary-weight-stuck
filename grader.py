@@ -11,6 +11,13 @@ NS = "bleater"
 KUBECONFIG = "/etc/rancher/k3s/k3s.yaml"
 
 
+def pod_has_istio_proxy(pod_spec):
+    """Check if a pod has istio-proxy in containers OR initContainers (native sidecar)."""
+    containers = [c["name"] for c in pod_spec.get("containers", [])]
+    init_containers = [c["name"] for c in pod_spec.get("initContainers", [])]
+    return "istio-proxy" in containers or "istio-proxy" in init_containers
+
+
 def run_kubectl(*args, namespace=None, timeout=30):
     """Execute a kubectl command and return (stdout, returncode)."""
     cmd = ["kubectl", f"--kubeconfig={KUBECONFIG}"]
@@ -136,13 +143,18 @@ def _find_mesh_pod(app_label):
         )
         if rc == 0 and pods_out.strip():
             for pod_name in pods_out.strip().split("\n"):
-                containers_out, _ = run_kubectl(
+                pod_json_out, _ = run_kubectl(
                     "get", "pod", pod_name.strip(),
-                    "-o", "jsonpath={.spec.containers[*].name}",
+                    "-o", "json",
                     namespace=NS,
                 )
-                if "istio-proxy" in (containers_out or ""):
-                    return pod_name.strip()
+                if pod_json_out:
+                    try:
+                        pod_data = json.loads(pod_json_out)
+                        if pod_has_istio_proxy(pod_data.get("spec", {})):
+                            return pod_name.strip()
+                    except json.JSONDecodeError:
+                        pass
     return None
 
 
@@ -245,12 +257,13 @@ def check_f1_canary_traffic_routing(app_label):
         try:
             pods = json.loads(canary_pods_out)
             for pod in pods.get("items", []):
-                containers = [c["name"] for c in pod.get("spec", {}).get("containers", [])]
+                has_sidecar = pod_has_istio_proxy(pod.get("spec", {}))
                 statuses = pod.get("status", {}).get("containerStatuses", [])
+                init_statuses = pod.get("status", {}).get("initContainerStatuses", [])
                 all_ready = all(s.get("ready", False) for s in statuses) if statuses else False
                 if all_ready:
                     canary_pods_ready += 1
-                if "istio-proxy" in containers and all_ready:
+                if has_sidecar and all_ready:
                     canary_with_sidecar += 1
         except json.JSONDecodeError:
             pass
@@ -426,8 +439,7 @@ def check_f3_service_mesh_integrity(app_label):
             items = pods.get("items", [])
             canary_count = len(items)
             for pod in items:
-                containers = [c["name"] for c in pod.get("spec", {}).get("containers", [])]
-                if "istio-proxy" in containers:
+                if pod_has_istio_proxy(pod.get("spec", {})):
                     sidecar_count += 1
         except json.JSONDecodeError:
             pass
@@ -604,8 +616,7 @@ def check_f4_drift_resilience(app_label):
         try:
             pods = json.loads(pods_out)
             for pod in pods.get("items", []):
-                containers = [c["name"] for c in pod.get("spec", {}).get("containers", [])]
-                if "istio-proxy" in containers:
+                if pod_has_istio_proxy(pod.get("spec", {})):
                     labeled_with_sidecar += 1
         except json.JSONDecodeError:
             pass
