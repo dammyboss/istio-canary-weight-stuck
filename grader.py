@@ -367,21 +367,27 @@ def check_f1_canary_traffic_routing(app_label, svc_name):
         print(f"  [FAIL] Check 3: VirtualService weights = {vs_weights} "
               f"(expected stable:90, canary:10)")
 
-    # Check 4: No 503 errors for canary
+    # Check 4: No significant 503 errors for canary (EnvoyFilter removed)
+    # Use 2m window to minimize pre-fix residual errors bleeding into the window
     error_rate = 0.0
     for query in [
-        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code="503"}}[5m]))',
-        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",response_code="503"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code="503"}}[2m]))',
+        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",response_code="503"}}[2m]))',
     ]:
         error_rate = prom_query_value(query)
         if error_rate > 0:
             break
 
-    if error_rate == 0:
-        print(f"  [PASS] Check 4: No 503 errors for canary in Prometheus")
+    # Allow tiny residual error rate (< 5% of canary traffic) from pre-fix window overlap
+    error_threshold = max(canary_rate * 0.05, 0.01) if canary_rate > 0 else 0.01
+    if error_rate <= error_threshold:
+        if error_rate > 0:
+            print(f"  [PASS] Check 4: Canary 503 rate = {error_rate:.4f} (residual, below threshold)")
+        else:
+            print(f"  [PASS] Check 4: No 503 errors for canary in Prometheus")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 4: Canary 503 error rate = {error_rate:.4f} req/s")
+        print(f"  [FAIL] Check 4: Canary 503 error rate = {error_rate:.4f} req/s (threshold: {error_threshold:.4f})")
 
     score = 1.0 if checks_passed == total else 0.0
     print(f"{'PASSED' if score == 1.0 else 'FAILED'} F1 ({checks_passed}/{total})")
@@ -804,21 +810,27 @@ def check_f5_canary_golden_signals(app_label, svc_name):
         else:
             print(f"  [FAIL] Check 3: No traces and no canary traffic confirmed")
 
-    # Check 4: No 503 errors for canary
+    # Check 4: No significant 503 errors for canary (EnvoyFilter removed)
+    # Use 2m window to minimize pre-fix residual errors bleeding into the window
     error_rate = 0.0
     for query in [
-        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code="503"}}[5m]))',
-        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",response_code="503"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code="503"}}[2m]))',
+        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",response_code="503"}}[2m]))',
     ]:
         error_rate = prom_query_value(query)
         if error_rate > 0:
             break
 
-    if error_rate == 0:
-        print(f"  [PASS] Check 4: No 503 errors for canary in Prometheus")
+    # Allow tiny residual error rate (< 5% of canary traffic) from pre-fix window overlap
+    error_threshold = max(canary_rate * 0.05, 0.01) if canary_rate > 0 else 0.01
+    if error_rate <= error_threshold:
+        if error_rate > 0:
+            print(f"  [PASS] Check 4: Canary 503 rate = {error_rate:.4f} (residual, below threshold)")
+        else:
+            print(f"  [PASS] Check 4: No 503 errors for canary in Prometheus")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 4: Canary 503 error rate = {error_rate:.4f} req/s")
+        print(f"  [FAIL] Check 4: Canary 503 error rate = {error_rate:.4f} req/s (threshold: {error_threshold:.4f})")
 
     score = 1.0 if checks_passed == total else 0.0
     print(f"{'PASSED' if score == 1.0 else 'FAILED'} F5 ({checks_passed}/{total})")
