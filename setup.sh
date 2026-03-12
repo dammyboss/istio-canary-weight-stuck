@@ -392,7 +392,8 @@ try:
     print(m.group(1).strip() if m else 'password')
 except: print('password')
 " 2>/dev/null)
-GITEA_CRED="root:${GITEA_PASS}"
+GITEA_PASS_ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${GITEA_PASS}', safe=''))")
+GITEA_CRED="root:${GITEA_PASS_ENC}"
 GITEA_API="http://${GITEA_CRED}@gitea.devops.local./api/v1"
 
 echo "  Gitea credentials retrieved"
