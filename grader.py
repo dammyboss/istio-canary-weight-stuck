@@ -841,7 +841,7 @@ def check_f5_canary_golden_signals(app_label, svc_name):
 # MAIN GRADING FUNCTION
 # ======================================================================
 
-def grade() -> GradingResult:
+def grade(transcript: str) -> GradingResult:
     """
     Main grading function.
 
