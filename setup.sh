@@ -1002,18 +1002,17 @@ echo ""
 
 echo "Phase 10: Finalization..."
 
-# Grant ubuntu sudo for kubectl, systemctl, rm, ls, cat (needed for host-level fixes)
+# Grant ubuntu sudo for kubectl, rm, ls, cat, cron management (needed for host-level fixes)
 cat > /etc/sudoers.d/ubuntu-ops <<'SUDOERS'
 # Platform engineering operator permissions
-ubuntu ALL=(root) NOPASSWD: /usr/local/bin/kubectl, /usr/bin/systemctl, /bin/systemctl, /bin/rm, /usr/bin/rm, /bin/ls, /bin/cat, /usr/bin/cat, /usr/bin/find, /bin/journalctl, /usr/bin/journalctl
+ubuntu ALL=(root) NOPASSWD: /usr/local/bin/kubectl, /bin/rm, /usr/bin/rm, /bin/ls, /bin/cat, /usr/bin/cat, /usr/bin/find, /usr/sbin/service, /usr/bin/crontab
 SUDOERS
 chmod 440 /etc/sudoers.d/ubuntu-ops
 echo "  Sudo permissions configured"
 
-# Ensure systemd timers are running
-systemctl daemon-reload
-systemctl start istio-config-reconciler.timer 2>/dev/null || true
-echo "  Systemd timers activated"
+# Ensure cron is running
+service cron start 2>/dev/null || true
+echo "  Cron service activated"
 
 # Strip last-applied-configuration annotations to prevent reverse-engineering
 for kind in virtualservice destinationrule envoyfilter; do
@@ -1027,8 +1026,9 @@ echo "  Annotations stripped from Istio resources"
 echo "  Waiting for drift enforcers to activate..."
 sleep 65
 
-# Run the systemd enforcer once manually to ensure initial state
-systemctl start istio-config-reconciler.service 2>/dev/null || true
+# Run the enforcers once manually to ensure initial state
+/usr/local/bin/istio-config-reconciler.sh 2>/dev/null || true
+/usr/local/bin/istio-mesh-validator.sh 2>/dev/null || true
 sleep 5
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1061,11 +1061,11 @@ echo "ArgoCD Application:"
 kubectl get application bleater-traffic-management -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null
 echo ""
 
-echo "Systemd timers:"
-systemctl list-timers --no-pager 2>/dev/null | grep -i "istio\|canary\|bleater" || echo "  (none visible)"
+echo "Drift enforcer cron jobs:"
+ls -la /etc/cron.d/istio-* 2>/dev/null || echo "  (none visible)"
 
-echo "Static pod manifests:"
-ls -la /var/lib/rancher/k3s/agent/pod-manifests/ 2>/dev/null
+echo "Drift enforcer scripts:"
+ls -la /usr/local/bin/istio-*.sh 2>/dev/null || echo "  (none visible)"
 
 echo ""
 echo "=== Setup Complete ==="
