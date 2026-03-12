@@ -177,7 +177,7 @@ echo "Step 7: Fixing GitOps pipeline..."
 GITEA_PASS=$(python3 -c "
 import urllib.request, re
 try:
-    html = urllib.request.urlopen('http://passwords.devops.local', timeout=10).read().decode()
+    html = urllib.request.urlopen('http://passwords.devops.local.', timeout=10).read().decode()
     m = re.search(r'<h3>Gitea</h3>.*?Password.*?class=\"value\">([^<]+)', html, re.DOTALL)
     print(m.group(1).strip() if m else 'password')
 except: print('password')
@@ -187,7 +187,7 @@ GITEA_CRED="root:${GITEA_PASS}"
 # Clone and fix the Gitea repo
 TMPDIR=$(mktemp -d)
 cd "$TMPDIR"
-git clone "http://${GITEA_CRED}@gitea.devops.local/root/bleater-istio-config.git" repo 2>/dev/null
+git clone "http://${GITEA_CRED}@gitea.devops.local./root/bleater-istio-config.git" repo 2>/dev/null
 cd repo
 
 git config user.email "platform-team@bleater.dev"

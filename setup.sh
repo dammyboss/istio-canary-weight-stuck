@@ -360,17 +360,40 @@ echo ""
 
 echo "Phase 4: Setting up GitOps pipeline (Gitea + ArgoCD)..."
 
+# Wait for Gitea to be ready
+echo "  Waiting for Gitea..."
+ELAPSED=0
+until kubectl get pods -n gitea -l app.kubernetes.io/name=gitea -o jsonpath='{.items[0].status.phase}' 2>/dev/null | grep -q Running; do
+    if [ $ELAPSED -ge 300 ]; then
+        echo "Error: Gitea not ready after 300s"
+        exit 1
+    fi
+    sleep 5
+    ELAPSED=$((ELAPSED + 5))
+done
+# Wait for Gitea HTTP to actually respond
+ELAPSED=0
+until curl -sf -o /dev/null http://gitea.devops.local. 2>/dev/null; do
+    if [ $ELAPSED -ge 120 ]; then
+        echo "Error: Gitea HTTP not responding after 120s"
+        exit 1
+    fi
+    sleep 5
+    ELAPSED=$((ELAPSED + 5))
+done
+echo "  Gitea ready"
+
 # Get Gitea credentials
 GITEA_PASS=$(python3 -c "
 import urllib.request, re
 try:
-    html = urllib.request.urlopen('http://passwords.devops.local', timeout=10).read().decode()
+    html = urllib.request.urlopen('http://passwords.devops.local.', timeout=10).read().decode()
     m = re.search(r'<h3>Gitea</h3>.*?Password.*?class=\"value\">([^<]+)', html, re.DOTALL)
     print(m.group(1).strip() if m else 'password')
 except: print('password')
 " 2>/dev/null)
 GITEA_CRED="root:${GITEA_PASS}"
-GITEA_API="http://${GITEA_CRED}@gitea.devops.local/api/v1"
+GITEA_API="http://${GITEA_CRED}@gitea.devops.local./api/v1"
 
 echo "  Gitea credentials retrieved"
 
@@ -386,7 +409,7 @@ sleep 3
 # Clone and populate the repo with broken manifests
 TMPDIR=$(mktemp -d)
 cd "$TMPDIR"
-git clone "http://${GITEA_CRED}@gitea.devops.local/root/bleater-istio-config.git" repo 2>/dev/null
+git clone "http://${GITEA_CRED}@gitea.devops.local./root/bleater-istio-config.git" repo 2>/dev/null
 cd repo
 
 git config user.email "platform-team@bleater.dev"
@@ -888,14 +911,27 @@ echo ""
 
 echo "Phase 8: Posting incident discussion to Mattermost..."
 
+# Wait for Mattermost to be ready
+echo "  Waiting for Mattermost..."
+MATTERMOST_URL="http://mattermost.devops.local."
+ELAPSED=0
+until curl -sf -o /dev/null "${MATTERMOST_URL}/api/v4/system/ping" 2>/dev/null; do
+    if [ $ELAPSED -ge 300 ]; then
+        echo "  Warning: Mattermost not ready after 300s, skipping messages"
+        break
+    fi
+    sleep 5
+    ELAPSED=$((ELAPSED + 5))
+done
+echo "  Mattermost ready"
+
 # Try to post messages to Mattermost for the fake incident thread
-MATTERMOST_URL="http://mattermost.devops.local"
 
 # Get Mattermost credentials
 MM_PASS=$(python3 -c "
 import urllib.request, re
 try:
-    html = urllib.request.urlopen('http://passwords.devops.local', timeout=10).read().decode()
+    html = urllib.request.urlopen('http://passwords.devops.local.', timeout=10).read().decode()
     m = re.search(r'<h3>Mattermost</h3>.*?Password.*?class=\"value\">([^<]+)', html, re.DOTALL)
     print(m.group(1).strip() if m else 'changeme')
 except: print('changeme')
