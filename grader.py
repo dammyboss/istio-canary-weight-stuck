@@ -125,7 +125,46 @@ def prom_query_value(query):
 
 
 def _find_mesh_pod(app_label):
-    """Find a running pod with istio-proxy sidecar for exec."""
+    """Find a running pod with istio-proxy sidecar for exec.
+
+    Prefers non-bleat-service pods to avoid self-routing issues where
+    traffic from bleat-service to itself may bypass VirtualService routing.
+    """
+    # First try non-bleat-service pods with sidecars
+    for alt_label in ["app=api-gateway", "app=timeline-service",
+                      "app=authentication-service", "app=fanout-service"]:
+        pods_out, rc = run_kubectl(
+            "get", "pods", "-l", alt_label,
+            "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}",
+            namespace=NS,
+        )
+        if rc == 0 and pods_out.strip():
+            for pod_name in pods_out.strip().split("\n"):
+                pod_name = pod_name.strip()
+                if not pod_name:
+                    continue
+                pod_json_out, _ = run_kubectl(
+                    "get", "pod", pod_name,
+                    "-o", "json",
+                    namespace=NS,
+                )
+                if pod_json_out:
+                    try:
+                        pod_data = json.loads(pod_json_out)
+                        if pod_has_istio_proxy(pod_data.get("spec", {})):
+                            # Check pod is Ready
+                            conditions = pod_data.get("status", {}).get("conditions", [])
+                            is_ready = any(
+                                c.get("type") == "Ready" and c.get("status") == "True"
+                                for c in conditions
+                            )
+                            if is_ready:
+                                print(f"  Using traffic source: {pod_name} ({alt_label})")
+                                return pod_name
+                    except json.JSONDecodeError:
+                        pass
+
+    # Fallback to bleat-service pods
     for label_set in [f"app={app_label},version=stable", f"app={app_label}"]:
         pods_out, rc = run_kubectl(
             "get", "pods", "-l", label_set,
@@ -134,8 +173,11 @@ def _find_mesh_pod(app_label):
         )
         if rc == 0 and pods_out.strip():
             for pod_name in pods_out.strip().split("\n"):
+                pod_name = pod_name.strip()
+                if not pod_name:
+                    continue
                 pod_json_out, _ = run_kubectl(
-                    "get", "pod", pod_name.strip(),
+                    "get", "pod", pod_name,
                     "-o", "json",
                     namespace=NS,
                 )
@@ -143,7 +185,8 @@ def _find_mesh_pod(app_label):
                     try:
                         pod_data = json.loads(pod_json_out)
                         if pod_has_istio_proxy(pod_data.get("spec", {})):
-                            return pod_name.strip()
+                            print(f"  Using traffic source (fallback): {pod_name}")
+                            return pod_name
                     except json.JSONDecodeError:
                         pass
     return None

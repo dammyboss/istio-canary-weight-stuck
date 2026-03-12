@@ -23,6 +23,11 @@ if [ -z "$SVC_NAME" ]; then
 fi
 SVC_NAME=${SVC_NAME:-bleater-bleat-service}
 echo "  K8s service name: $SVC_NAME"
+
+# Discover service port
+SVC_PORT=$(sudo kubectl get svc "$SVC_NAME" -n "$NS" -o jsonpath='{.spec.ports[0].port}' 2>/dev/null)
+SVC_PORT=${SVC_PORT:-8003}
+echo "  Service port: $SVC_PORT"
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -261,16 +266,52 @@ echo "  Gitea repo fixed: VirtualService 90/10, correct subsets"
 cd /
 rm -rf "$TMPDIR"
 
-# B7: Fix ArgoCD Application source path
+# Ensure ArgoCD repo credentials exist for Gitea access
+# ArgoCD pods use CoreDNS → ClusterIP (port 3000), not host ingress (port 80)
+sudo kubectl apply -f - <<REPOSECEOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bleater-istio-config-repo
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: repository
+stringData:
+  type: git
+  url: http://gitea.devops.local:3000/root/bleater-istio-config.git
+  username: root
+  password: "${GITEA_PASS}"
+REPOSECEOF
+echo "  ArgoCD repo credentials configured"
+
+# B7: Fix ArgoCD Application source path and ensure correct repoURL
 sudo kubectl patch application bleater-traffic-management -n argocd --type=json \
-    -p='[{"op":"replace","path":"/spec/source/path","value":"deploy/istio"}]' \
-    2>/dev/null && echo "  ArgoCD Application: source path fixed to deploy/istio" || true
+    -p='[
+        {"op":"replace","path":"/spec/source/path","value":"deploy/istio"},
+        {"op":"replace","path":"/spec/source/repoURL","value":"http://gitea.devops.local:3000/root/bleater-istio-config.git"}
+    ]' \
+    2>/dev/null && echo "  ArgoCD Application: path and repoURL fixed" || true
 
 # Trigger an ArgoCD sync
 sudo kubectl patch application bleater-traffic-management -n argocd --type=merge \
     -p='{"operation":{"initiatedBy":{"username":"solution"},"sync":{"revision":"HEAD"}}}' \
     2>/dev/null || true
 echo "  ArgoCD sync triggered"
+
+# Wait for ArgoCD to sync
+echo "  Waiting for ArgoCD sync..."
+ELAPSED=0
+while [ $ELAPSED -lt 120 ]; do
+    SYNC_STATUS=$(sudo kubectl get application bleater-traffic-management -n argocd \
+        -o jsonpath='{.status.sync.status}' 2>/dev/null)
+    if [ "$SYNC_STATUS" = "Synced" ]; then
+        echo "  ArgoCD sync complete: $SYNC_STATUS"
+        break
+    fi
+    echo "  ArgoCD sync status: $SYNC_STATUS (${ELAPSED}s)"
+    sleep 10
+    ELAPSED=$((ELAPSED + 10))
+done
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -287,30 +328,15 @@ echo "  Stable deployment rolled out"
 sudo kubectl rollout status deployment "${BLEAT_DEPLOY}-canary" -n "$NS" --timeout=300s 2>/dev/null || true
 echo "  Canary deployment rolled out"
 
-# Wait for all pods to be ready with sidecar
+# Wait for all pods to be ready (works with native sidecars too)
 echo "  Waiting for pods to be fully ready..."
-ELAPSED=0
-MAX_WAIT=300
-while [ $ELAPSED -lt $MAX_WAIT ]; do
-    # Check canary pods have 2 containers (app + istio-proxy)
-    CANARY_READY=$(sudo kubectl get pods -n "$NS" -l app=${STABLE_APP_LABEL},version=canary \
-        -o jsonpath='{range .items[*]}{.status.containerStatuses[*].ready}{"\n"}{end}' 2>/dev/null | \
-        { grep -c "true true" 2>/dev/null || echo 0; } | head -1)
-    CANARY_TOTAL=$(sudo kubectl get pods -n "$NS" -l app=${STABLE_APP_LABEL},version=canary \
-        --no-headers 2>/dev/null | wc -l | tr -d ' ')
+sudo kubectl wait --for=condition=ready pod -l app=${STABLE_APP_LABEL},version=canary \
+    -n "$NS" --timeout=300s 2>/dev/null && echo "  Canary pods ready" || echo "  Canary pod wait timed out"
+sudo kubectl wait --for=condition=ready pod -l app=${STABLE_APP_LABEL},version=stable \
+    -n "$NS" --timeout=300s 2>/dev/null && echo "  Stable pods ready" || echo "  Stable pod wait timed out"
 
-    STABLE_READY=$(sudo kubectl get pods -n "$NS" -l app=${STABLE_APP_LABEL},version=stable \
-        -o jsonpath='{range .items[*]}{.status.containerStatuses[*].ready}{"\n"}{end}' 2>/dev/null | \
-        { grep -c "true true" 2>/dev/null || echo 0; } | head -1)
-
-    if [ "$CANARY_READY" -ge 1 ] && [ "$STABLE_READY" -ge 1 ]; then
-        echo "  All pods ready with sidecars (canary: ${CANARY_READY}/${CANARY_TOTAL}, stable: ${STABLE_READY})"
-        break
-    fi
-    echo "  Waiting... canary=${CANARY_READY}/${CANARY_TOTAL}, stable=${STABLE_READY} (${ELAPSED}s)"
-    sleep 10
-    ELAPSED=$((ELAPSED + 10))
-done
+# Extra wait for Envoy sidecar to sync config from istiod
+sleep 10
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -319,22 +345,42 @@ echo ""
 
 echo "Step 9: Generating traffic for Prometheus metrics..."
 
-# Generate traffic by exec-ing into an existing mesh pod (no external images needed)
+# Generate traffic from a DIFFERENT mesh pod (not bleat-service itself)
+# to ensure outbound Envoy sidecar properly routes through VirtualService
 SVC_URL="${SVC_NAME}.${NS}.svc.cluster.local"
-EXEC_POD=$(sudo kubectl get pods -n "$NS" -l app=${STABLE_APP_LABEL},version=stable \
-    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+
+# Find a non-bleat-service pod with sidecar for traffic generation
+EXEC_POD=""
+for LABEL in "app=api-gateway" "app=timeline-service" "app=authentication-service" "app=fanout-service"; do
+    POD=$(sudo kubectl get pods -n "$NS" -l ${LABEL} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [ -n "$POD" ]; then
+        READY=$(sudo kubectl get pod "$POD" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+        if [ "$READY" = "True" ]; then
+            EXEC_POD="$POD"
+            echo "  Using traffic source pod: $EXEC_POD"
+            break
+        fi
+    fi
+done
+
+# Fallback to stable bleat-service pod if no other pod found
+if [ -z "$EXEC_POD" ]; then
+    EXEC_POD=$(sudo kubectl get pods -n "$NS" -l app=${STABLE_APP_LABEL},version=stable \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    echo "  Fallback traffic source: $EXEC_POD"
+fi
 
 if [ -n "$EXEC_POD" ]; then
     sudo kubectl exec "$EXEC_POD" -n "$NS" -- sh -c "
         for i in \$(seq 1 300); do
-            wget -q -O /dev/null -T 2 http://${SVC_URL}:8080/ 2>/dev/null || \
-            curl -sf -o /dev/null -m 2 http://${SVC_URL}:8080/ 2>/dev/null || true
+            wget -q -O /dev/null -T 2 http://${SVC_URL}:${SVC_PORT}/ 2>/dev/null || \
+            curl -sf -o /dev/null -m 2 http://${SVC_URL}:${SVC_PORT}/ 2>/dev/null || true
         done
         echo 'Traffic generation complete'
     " 2>/dev/null &
-    echo "  Traffic generator running in background via exec (300 requests)"
+    echo "  Traffic generator running in background via exec (300 requests to port ${SVC_PORT})"
 else
-    echo "  Warning: No stable pod found for traffic generation"
+    echo "  Warning: No pod found for traffic generation"
 fi
 echo ""
 

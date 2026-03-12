@@ -534,6 +534,24 @@ echo "  B8: Gitea repo populated with broken VirtualService (100/0, canary-v2)"
 cd /
 rm -rf "$TMPDIR"
 
+# Create ArgoCD repo credentials for Gitea access
+# Note: ArgoCD runs as a pod, so uses CoreDNS → ClusterIP (port 3000), not host ingress (port 80)
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bleater-istio-config-repo
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: repository
+stringData:
+  type: git
+  url: http://gitea.devops.local:3000/root/bleater-istio-config.git
+  username: root
+  password: "${GITEA_PASS}"
+EOF
+echo "  ArgoCD repo credentials configured"
+
 # B7 + B9: Create ArgoCD Application with wrong source path + selfHeal
 kubectl apply -f - <<EOF
 apiVersion: argoproj.io/v1alpha1
@@ -549,7 +567,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: http://gitea.devops.local/root/bleater-istio-config.git
+    repoURL: http://gitea.devops.local:3000/root/bleater-istio-config.git
     targetRevision: main
     # B7: Wrong path — manifests are in deploy/istio/ not deploy/canary/
     path: deploy/canary
