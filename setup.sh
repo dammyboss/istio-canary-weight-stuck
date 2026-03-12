@@ -31,6 +31,21 @@ echo "k3s is ready!"
 
 NS="bleater"
 
+# Retry wrapper for kubectl commands that may fail due to transient API server unavailability
+kubectl_retry() {
+    local retries=5
+    local wait=10
+    for i in $(seq 1 $retries); do
+        if kubectl "$@" 2>/dev/null; then
+            return 0
+        fi
+        echo "  kubectl retry $i/$retries (waiting ${wait}s)..."
+        sleep $wait
+    done
+    # Final attempt without suppressing errors
+    kubectl "$@"
+}
+
 echo "=== Setting up Istio Canary Weight Stuck Scenario ==="
 echo ""
 
@@ -73,8 +88,15 @@ done
 kubectl wait --for=condition=available deployment/istiod -n istio-system --timeout=300s 2>/dev/null || true
 echo "  Istio control plane ready"
 
+# Wait for API server to be stable before applying CRDs
+echo "  Verifying API server stability..."
+for i in $(seq 1 5); do
+    kubectl get nodes &>/dev/null && break
+    sleep 5
+done
+
 # Enable Istio telemetry metrics (ensures istio_requests_total is exported to Prometheus)
-kubectl apply -f - <<TELEOF
+kubectl_retry apply -f - <<TELEOF
 apiVersion: telemetry.istio.io/v1
 kind: Telemetry
 metadata:
