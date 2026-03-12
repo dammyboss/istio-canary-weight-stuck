@@ -23,29 +23,20 @@ echo ""
 
 echo "Step 1: Removing drift enforcement..."
 
-# B10: Stop and remove systemd timer
-sudo systemctl stop istio-config-reconciler.timer 2>/dev/null || true
-sudo systemctl disable istio-config-reconciler.timer 2>/dev/null || true
-sudo rm -f /etc/systemd/system/istio-config-reconciler.service
-sudo rm -f /etc/systemd/system/istio-config-reconciler.timer
-sudo systemctl daemon-reload
-echo "  Systemd timer istio-config-reconciler removed"
+# B10: Remove cron job istio-config-reconciler
+sudo rm -f /etc/cron.d/istio-config-reconciler
+sudo rm -f /usr/local/bin/istio-config-reconciler.sh
+echo "  Cron job istio-config-reconciler removed"
 
-# B11: Remove static pod manifest
-sudo rm -f /var/lib/rancher/k3s/agent/pod-manifests/istio-mesh-validator.yaml
-echo "  Static pod manifest istio-mesh-validator removed"
+# B11: Remove cron job istio-mesh-validator
+sudo rm -f /etc/cron.d/istio-mesh-validator
+sudo rm -f /usr/local/bin/istio-mesh-validator.sh
+sudo rm -rf /var/lib/istio-mesh-validator
+echo "  Cron job istio-mesh-validator removed"
 
-# Wait for static pod to terminate
-echo "  Waiting for static pod to terminate..."
-ELAPSED=0
-while sudo kubectl get pod istio-mesh-validator -n kube-system &>/dev/null 2>&1; do
-    if [ $ELAPSED -ge 120 ]; then
-        echo "  Warning: static pod still present after 120s, continuing"
-        break
-    fi
-    sleep 5
-    ELAPSED=$((ELAPSED + 5))
-done
+# Kill any running enforcer processes
+sudo pkill -f istio-config-reconciler.sh 2>/dev/null || true
+sudo pkill -f istio-mesh-validator.sh 2>/dev/null || true
 echo "  Drift enforcers neutralized"
 echo ""
 
@@ -370,12 +361,12 @@ sudo kubectl get application bleater-traffic-management -n argocd -o jsonpath=' 
 echo ""
 
 echo ""
-echo "Systemd timers (should be empty):"
-systemctl list-timers --no-pager 2>/dev/null | grep -i "istio\|canary\|reconcil" || echo "  None"
+echo "Drift enforcer cron jobs (should be empty):"
+ls /etc/cron.d/istio-* 2>/dev/null || echo "  None"
 
 echo ""
-echo "Static pod manifests:"
-ls /var/lib/rancher/k3s/agent/pod-manifests/ 2>/dev/null || echo "  Directory empty or doesn't exist"
+echo "Drift enforcer scripts (should be empty):"
+ls /usr/local/bin/istio-*.sh 2>/dev/null || echo "  None"
 
 echo ""
 echo "=== Solution Complete ==="

@@ -558,102 +558,46 @@ echo ""
 
 echo "Phase 5: Installing drift enforcement agents..."
 
-# B10: Systemd timer that re-applies broken state every 2 minutes
+# B10: Cron job that re-applies broken state every 2 minutes
 # - Patches DestinationRule canary subset selector back to version: canary
 # - Removes version: canary label from canary pods
 # - Re-adds sidecar.istio.io/inject: false to canary deployment
-cat > /etc/systemd/system/istio-config-reconciler.service <<SERVICEEOF
-[Unit]
-Description=Istio Configuration Reconciler — validates and reconciles Istio mesh configuration
-Documentation=https://istio.io/latest/docs/ops/configuration/mesh/
+cat > /usr/local/bin/istio-config-reconciler.sh <<RECONCILEREOF
+#!/bin/bash
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# Reconcile DestinationRule subset selectors to match policy
+/usr/local/bin/kubectl patch destinationrule bleat-service -n ${NS} --type=json \
+    -p='[{"op":"replace","path":"/spec/subsets/1/labels","value":{"version":"canary"}}]' 2>/dev/null
+# Remove non-policy labels from canary workloads
+for pod in \$(/usr/local/bin/kubectl get pods -n ${NS} -l app=${STABLE_APP_LABEL},track=canary -o name 2>/dev/null); do
+    /usr/local/bin/kubectl label \$pod -n ${NS} version- 2>/dev/null
+done
+# Ensure sidecar injection policy compliance on canary deployment
+/usr/local/bin/kubectl patch deployment ${BLEAT_DEPLOY}-canary -n ${NS} --type=json \
+    -p='[{"op":"add","path":"/spec/template/metadata/annotations/sidecar.istio.io~1inject","value":"false"}]' 2>/dev/null
+echo "[\$(date -u +%FT%TZ)] istio-config-reconciler: reconciliation complete"
+RECONCILEREOF
+chmod +x /usr/local/bin/istio-config-reconciler.sh
 
-[Service]
-Type=oneshot
-Environment=KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-ExecStart=/bin/bash -c ' \
-    # Reconcile DestinationRule subset selectors to match policy \
-    /usr/local/bin/kubectl patch destinationrule bleat-service -n ${NS} --type=json \
-        -p="[{\"op\":\"replace\",\"path\":\"/spec/subsets/1/labels\",\"value\":{\"version\":\"canary\"}}]" 2>/dev/null; \
-    # Remove non-policy labels from canary workloads \
-    for pod in \$(/usr/local/bin/kubectl get pods -n ${NS} -l app=${STABLE_APP_LABEL},track=canary -o name 2>/dev/null); do \
-        /usr/local/bin/kubectl label \$pod -n ${NS} version- 2>/dev/null; \
-    done; \
-    # Ensure sidecar injection policy compliance on canary deployment \
-    /usr/local/bin/kubectl patch deployment ${BLEAT_DEPLOY}-canary -n ${NS} --type=json \
-        -p="[{\"op\":\"add\",\"path\":\"/spec/template/metadata/annotations/sidecar.istio.io~1inject\",\"value\":\"false\"}]" 2>/dev/null; \
-    echo "[\$(date -u +%%FT%%TZ)] istio-config-reconciler: reconciliation complete" \
-'
-SERVICEEOF
+cat > /etc/cron.d/istio-config-reconciler <<'CRONEOF'
+SHELL=/bin/bash
+KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+*/2 * * * * root /usr/local/bin/istio-config-reconciler.sh >> /var/log/istio-reconciler.log 2>&1
+CRONEOF
+chmod 644 /etc/cron.d/istio-config-reconciler
 
-cat > /etc/systemd/system/istio-config-reconciler.timer <<'TIMEREOF'
-[Unit]
-Description=Periodic Istio configuration reconciliation
-Documentation=https://istio.io/latest/docs/ops/configuration/mesh/
+# Ensure cron is running
+service cron start 2>/dev/null || true
 
-[Timer]
-OnBootSec=60
-OnUnitActiveSec=120
-RandomizedDelaySec=10
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-TIMEREOF
-
-systemctl daemon-reload
-systemctl enable istio-config-reconciler.timer
-systemctl start istio-config-reconciler.timer
-echo "  B10: Systemd timer istio-config-reconciler installed (every 2 min)"
+echo "  B10: Cron job istio-config-reconciler installed (every 2 min)"
 echo "        - Reverts DestinationRule subset labels"
 echo "        - Removes version label from canary pods"
 echo "        - Re-adds sidecar inject: false to canary deployment"
 
-# B11: Static pod manifest that enforces VirtualService weights + re-applies EnvoyFilter
-mkdir -p /var/lib/rancher/k3s/agent/pod-manifests
-cat > /var/lib/rancher/k3s/agent/pod-manifests/istio-mesh-validator.yaml <<STATICPOD
-apiVersion: v1
-kind: Pod
-metadata:
-  name: istio-mesh-validator
-  namespace: kube-system
-  labels:
-    k8s-app: istio-mesh-validator
-    tier: node
-    component: mesh-validation
-  annotations:
-    kubernetes.io/description: "Validates Istio mesh configuration integrity and reconciles drift"
-spec:
-  hostNetwork: true
-  priorityClassName: system-node-critical
-  containers:
-  - name: validator
-    image: bitnami/kubectl:latest
-    imagePullPolicy: IfNotPresent
-    command:
-    - /bin/sh
-    - -c
-    - |
-      # istio-mesh-validator: Mesh configuration integrity monitor
-      # Validates VirtualService weights and EnvoyFilter configuration
-      # Managed by kubelet — infrastructure component
-      export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-
-      while true; do
-        echo "[\$(date -u +%FT%TZ)] istio-mesh-validator: starting validation cycle"
-
-        # Validate VirtualService weight policy (stable=100, canary-v2=0)
-        CURRENT_WEIGHT=\$(kubectl get virtualservice bleat-service -n ${NS} \
-            -o jsonpath='{.spec.http[0].route[0].weight}' 2>/dev/null)
-        if [ "\$CURRENT_WEIGHT" != "100" ]; then
-          echo "  Weight drift detected (\$CURRENT_WEIGHT != 100), reconciling..."
-          kubectl patch virtualservice bleat-service -n ${NS} --type=json \
-              -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},{"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]' 2>/dev/null
-        fi
-
-        # Validate EnvoyFilter exists (re-create if deleted)
-        if ! kubectl get envoyfilter bleater-request-classifier -n ${NS} &>/dev/null; then
-          echo "  EnvoyFilter missing, re-applying..."
-          kubectl apply -f - <<'EFEOF'
+# B11: Cron job that enforces VirtualService weights + re-applies EnvoyFilter every 3 minutes
+# Store the EnvoyFilter manifest for re-application
+mkdir -p /var/lib/istio-mesh-validator
+cat > /var/lib/istio-mesh-validator/envoyfilter.yaml <<EFMANIFEST
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
@@ -701,28 +645,43 @@ spec:
                 end
               end
             end
-EFEOF
-        fi
+EFMANIFEST
 
-        echo "[\$(date -u +%FT%TZ)] istio-mesh-validator: validation cycle complete"
-        sleep 180
-      done
-    volumeMounts:
-    - name: k3s-config
-      mountPath: /etc/rancher/k3s
-      readOnly: true
-  volumes:
-  - name: k3s-config
-    hostPath:
-      path: /etc/rancher/k3s
-  tolerations:
-  - operator: Exists
-    effect: NoSchedule
-  - operator: Exists
-    effect: NoExecute
-STATICPOD
+cat > /usr/local/bin/istio-mesh-validator.sh <<VALIDATOREOF
+#!/bin/bash
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+# istio-mesh-validator: Mesh configuration integrity monitor
+# Validates VirtualService weights and EnvoyFilter configuration
 
-echo "  B11: Static pod istio-mesh-validator installed"
+echo "[\$(date -u +%FT%TZ)] istio-mesh-validator: starting validation cycle"
+
+# Validate VirtualService weight policy (stable=100, canary-v2=0)
+CURRENT_WEIGHT=\$(/usr/local/bin/kubectl get virtualservice bleat-service -n ${NS} \
+    -o jsonpath='{.spec.http[0].route[0].weight}' 2>/dev/null)
+if [ "\$CURRENT_WEIGHT" != "100" ]; then
+    echo "  Weight drift detected (\$CURRENT_WEIGHT != 100), reconciling..."
+    /usr/local/bin/kubectl patch virtualservice bleat-service -n ${NS} --type=json \
+        -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},{"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]' 2>/dev/null
+fi
+
+# Validate EnvoyFilter exists (re-create if deleted)
+if ! /usr/local/bin/kubectl get envoyfilter bleater-request-classifier -n ${NS} &>/dev/null; then
+    echo "  EnvoyFilter missing, re-applying..."
+    /usr/local/bin/kubectl apply -f /var/lib/istio-mesh-validator/envoyfilter.yaml 2>/dev/null
+fi
+
+echo "[\$(date -u +%FT%TZ)] istio-mesh-validator: validation cycle complete"
+VALIDATOREOF
+chmod +x /usr/local/bin/istio-mesh-validator.sh
+
+cat > /etc/cron.d/istio-mesh-validator <<'CRONEOF'
+SHELL=/bin/bash
+KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+*/3 * * * * root /usr/local/bin/istio-mesh-validator.sh >> /var/log/istio-mesh-validator.log 2>&1
+CRONEOF
+chmod 644 /etc/cron.d/istio-mesh-validator
+
+echo "  B11: Cron job istio-mesh-validator installed (every 3 min)"
 echo "        - Reverts VirtualService weights to 100/0"
 echo "        - Re-creates EnvoyFilter if deleted"
 echo ""
