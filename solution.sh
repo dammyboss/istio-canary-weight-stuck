@@ -192,7 +192,7 @@ GITEA_CRED="root:${GITEA_PASS_ENC}"
 # Clone and fix the Gitea repo
 TMPDIR=$(mktemp -d)
 cd "$TMPDIR"
-git clone "http://${GITEA_CRED}@gitea.devops.local./root/bleater-istio-config.git" repo 2>/dev/null
+git clone "http://${GITEA_CRED}@gitea.devops.local:3000/root/bleater-istio-config.git" repo 2>/dev/null
 cd repo
 
 git config user.email "platform-team@bleater.dev"
