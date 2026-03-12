@@ -101,8 +101,27 @@ def generate_mesh_traffic(app_label, num_requests=300):
     """
     print(f"  Generating {num_requests} requests through the mesh...")
 
+    # Find the actual service name (may be bleater-bleat-service, not bleat-service)
+    svc_name = app_label
+    svc_list_out, _ = run_kubectl(
+        "get", "svc", "-l", f"app={app_label}",
+        "-o", "jsonpath={.items[0].metadata.name}",
+        namespace=NS,
+    )
+    if svc_list_out and svc_list_out.strip():
+        svc_name = svc_list_out.strip()
+    else:
+        # Fallback: try with bleater- prefix
+        svc_list_out, _ = run_kubectl(
+            "get", "svc", f"bleater-{app_label}",
+            "-o", "jsonpath={.metadata.name}",
+            namespace=NS,
+        )
+        if svc_list_out and svc_list_out.strip():
+            svc_name = svc_list_out.strip()
+
     port_out, _ = run_kubectl(
-        "get", "svc", app_label,
+        "get", "svc", svc_name,
         "-o", "jsonpath={.spec.ports[0].port}",
         namespace=NS,
     )
@@ -116,8 +135,8 @@ def generate_mesh_traffic(app_label, num_requests=300):
 
     traffic_cmd = (
         f"for i in $(seq 1 {num_requests}); do "
-        f"wget -q -O /dev/null -T 2 http://{app_label}.{NS}.svc.cluster.local:{port}/ 2>/dev/null || "
-        f"curl -sf -o /dev/null -m 2 http://{app_label}.{NS}.svc.cluster.local:{port}/ 2>/dev/null || true; "
+        f"wget -q -O /dev/null -T 2 http://{svc_name}.{NS}.svc.cluster.local:{port}/ 2>/dev/null || "
+        f"curl -sf -o /dev/null -m 2 http://{svc_name}.{NS}.svc.cluster.local:{port}/ 2>/dev/null || true; "
         f"done; echo DONE"
     )
 
