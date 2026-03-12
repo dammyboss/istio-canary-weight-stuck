@@ -287,13 +287,13 @@ while [ $ELAPSED -lt $MAX_WAIT ]; do
     # Check canary pods have 2 containers (app + istio-proxy)
     CANARY_READY=$(sudo kubectl get pods -n "$NS" -l app=${STABLE_APP_LABEL},version=canary \
         -o jsonpath='{range .items[*]}{.status.containerStatuses[*].ready}{"\n"}{end}' 2>/dev/null | \
-        grep -c "true true" || echo "0")
+        { grep -c "true true" 2>/dev/null || echo 0; } | head -1)
     CANARY_TOTAL=$(sudo kubectl get pods -n "$NS" -l app=${STABLE_APP_LABEL},version=canary \
         --no-headers 2>/dev/null | wc -l | tr -d ' ')
 
     STABLE_READY=$(sudo kubectl get pods -n "$NS" -l app=${STABLE_APP_LABEL},version=stable \
         -o jsonpath='{range .items[*]}{.status.containerStatuses[*].ready}{"\n"}{end}' 2>/dev/null | \
-        grep -c "true true" || echo "0")
+        { grep -c "true true" 2>/dev/null || echo 0; } | head -1)
 
     if [ "$CANARY_READY" -ge 1 ] && [ "$STABLE_READY" -ge 1 ]; then
         echo "  All pods ready with sidecars (canary: ${CANARY_READY}/${CANARY_TOTAL}, stable: ${STABLE_READY})"
