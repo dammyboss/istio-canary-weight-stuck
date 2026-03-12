@@ -15,6 +15,14 @@ STABLE_APP_LABEL=$(sudo kubectl get deployment "$BLEAT_DEPLOY" -n "$NS" -o jsonp
 STABLE_APP_LABEL=${STABLE_APP_LABEL:-bleat-service}
 echo "  Stable deployment: $BLEAT_DEPLOY"
 echo "  App label: $STABLE_APP_LABEL"
+
+# Discover actual K8s service name
+SVC_NAME=$(sudo kubectl get svc -n "$NS" -l app=${STABLE_APP_LABEL} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+if [ -z "$SVC_NAME" ]; then
+    SVC_NAME=$(sudo kubectl get svc -n "$NS" -o name 2>/dev/null | grep -E "bleat-service|bleater-bleat" | head -1 | sed 's|service/||')
+fi
+SVC_NAME=${SVC_NAME:-bleater-bleat-service}
+echo "  K8s service name: $SVC_NAME"
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -107,7 +115,7 @@ metadata:
     app: ${STABLE_APP_LABEL}
     istio: traffic-management
 spec:
-  host: ${STABLE_APP_LABEL}
+  host: ${SVC_NAME}
   trafficPolicy:
     connectionPool:
       tcp:
@@ -143,15 +151,15 @@ metadata:
     istio: traffic-management
 spec:
   hosts:
-  - ${STABLE_APP_LABEL}
+  - ${SVC_NAME}
   http:
   - route:
     - destination:
-        host: ${STABLE_APP_LABEL}
+        host: ${SVC_NAME}
         subset: stable
       weight: 90
     - destination:
-        host: ${STABLE_APP_LABEL}
+        host: ${SVC_NAME}
         subset: canary
       weight: 10
 EOF
@@ -197,15 +205,15 @@ metadata:
     istio: traffic-management
 spec:
   hosts:
-  - ${STABLE_APP_LABEL}
+  - ${SVC_NAME}
   http:
   - route:
     - destination:
-        host: ${STABLE_APP_LABEL}
+        host: ${SVC_NAME}
         subset: stable
       weight: 90
     - destination:
-        host: ${STABLE_APP_LABEL}
+        host: ${SVC_NAME}
         subset: canary
       weight: 10
 VSEOF
@@ -221,7 +229,7 @@ metadata:
     app: ${STABLE_APP_LABEL}
     istio: traffic-management
 spec:
-  host: ${STABLE_APP_LABEL}
+  host: ${SVC_NAME}
   trafficPolicy:
     connectionPool:
       tcp:
@@ -312,7 +320,7 @@ echo ""
 echo "Step 9: Generating traffic for Prometheus metrics..."
 
 # Generate traffic by exec-ing into an existing mesh pod (no external images needed)
-SVC_URL="${STABLE_APP_LABEL}.${NS}.svc.cluster.local"
+SVC_URL="${SVC_NAME}.${NS}.svc.cluster.local"
 EXEC_POD=$(sudo kubectl get pods -n "$NS" -l app=${STABLE_APP_LABEL},version=stable \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 

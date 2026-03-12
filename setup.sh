@@ -73,6 +73,20 @@ done
 kubectl wait --for=condition=available deployment/istiod -n istio-system --timeout=300s 2>/dev/null || true
 echo "  Istio control plane ready"
 
+# Enable Istio telemetry metrics (ensures istio_requests_total is exported to Prometheus)
+kubectl apply -f - <<TELEOF
+apiVersion: telemetry.istio.io/v1
+kind: Telemetry
+metadata:
+  name: mesh-default
+  namespace: istio-system
+spec:
+  metrics:
+  - providers:
+    - name: prometheus
+TELEOF
+echo "  Istio telemetry metrics enabled"
+
 # Wait for ArgoCD
 echo "  Waiting for ArgoCD..."
 ELAPSED=0
@@ -150,6 +164,14 @@ echo "  bleat-service port: $BLEAT_PORT"
 STABLE_APP_LABEL=$(kubectl get deployment "$BLEAT_DEPLOY" -n "$NS" -o jsonpath='{.spec.template.metadata.labels.app}' 2>/dev/null)
 STABLE_APP_LABEL=${STABLE_APP_LABEL:-bleat-service}
 echo "  stable app label: $STABLE_APP_LABEL"
+
+# Discover the actual K8s service name (may differ from app label)
+SVC_NAME=$(kubectl get svc -n "$NS" -l app=${STABLE_APP_LABEL} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+if [ -z "$SVC_NAME" ]; then
+    SVC_NAME=$(kubectl get svc -n "$NS" -o name 2>/dev/null | grep -E "bleat-service|bleater-bleat" | head -1 | sed 's|service/||')
+fi
+SVC_NAME=${SVC_NAME:-bleater-bleat-service}
+echo "  bleat-service K8s service name: $SVC_NAME"
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -249,7 +271,7 @@ metadata:
     platform.bleater.io/managed-by: "canary-rollout-controller"
     platform.bleater.io/last-updated: "2026-03-10T14:22:00Z"
 spec:
-  host: ${STABLE_APP_LABEL}
+  host: ${SVC_NAME}
   trafficPolicy:
     connectionPool:
       tcp:
@@ -282,15 +304,15 @@ metadata:
     platform.bleater.io/canary-weight: "10"
 spec:
   hosts:
-  - ${STABLE_APP_LABEL}
+  - ${SVC_NAME}
   http:
   - route:
     - destination:
-        host: ${STABLE_APP_LABEL}
+        host: ${SVC_NAME}
         subset: stable
       weight: 100
     - destination:
-        host: ${STABLE_APP_LABEL}
+        host: ${SVC_NAME}
         subset: canary-v2
       weight: 0
 EOF
@@ -434,15 +456,15 @@ metadata:
     platform.bleater.io/canary-weight: "10"
 spec:
   hosts:
-  - ${STABLE_APP_LABEL}
+  - ${SVC_NAME}
   http:
   - route:
     - destination:
-        host: ${STABLE_APP_LABEL}
+        host: ${SVC_NAME}
         subset: stable
       weight: 100
     - destination:
-        host: ${STABLE_APP_LABEL}
+        host: ${SVC_NAME}
         subset: canary-v2
       weight: 0
 VSEOF
@@ -461,7 +483,7 @@ metadata:
     platform.bleater.io/managed-by: "canary-rollout-controller"
     platform.bleater.io/last-updated: "2026-03-10T14:22:00Z"
 spec:
-  host: ${STABLE_APP_LABEL}
+  host: ${SVC_NAME}
   trafficPolicy:
     connectionPool:
       tcp:
