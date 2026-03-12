@@ -396,11 +396,11 @@ until kubectl get pods -n gitea -l app=gitea -o jsonpath='{.items[0].status.phas
 done
 
 # Discover Gitea service ClusterIP (dnsmasq maps gitea.devops.local to nginx, not Gitea directly)
-GITEA_SVC_IP=$(kubectl get svc -n gitea -l app=gitea -o jsonpath='{.items[0].spec.clusterIP}' 2>/dev/null)
+GITEA_SVC_IP=$(kubectl get svc gitea -n gitea -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
 if [ -z "$GITEA_SVC_IP" ]; then
-    GITEA_SVC_IP=$(kubectl get svc gitea-http -n gitea -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
+    GITEA_SVC_IP=$(kubectl get svc -n gitea -l app=gitea -o jsonpath='{.items[0].spec.clusterIP}' 2>/dev/null)
 fi
-GITEA_SVC_IP=${GITEA_SVC_IP:-"gitea-http.gitea.svc.cluster.local"}
+GITEA_SVC_IP=${GITEA_SVC_IP:-"10.43.79.1"}
 GITEA_HOST="${GITEA_SVC_IP}:3000"
 echo "  Gitea service endpoint: ${GITEA_HOST}"
 
