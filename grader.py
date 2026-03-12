@@ -149,45 +149,6 @@ def _find_mesh_pod(app_label):
     return None
 
 
-def _read_envoy_subset_stats(pod_name, port):
-    """
-    Read Envoy upstream request stats per subset from the sidecar admin API.
-    Returns dict: {subset_name: {"completed": N, "5xx": N}}
-    """
-    if not pod_name:
-        return {}
-    cmd = f"curl -s localhost:15000/stats | grep 'outbound|{port}|'"
-    stdout, rc = run_kubectl(
-        "exec", pod_name, "-c", "istio-proxy", "--",
-        "sh", "-c", cmd,
-        namespace=NS, timeout=15,
-    )
-    results = {}
-    for line in (stdout or "").split("\n"):
-        line = line.strip()
-        if not line or ":" not in line:
-            continue
-        # Format: cluster.outbound|PORT|SUBSET|FQDN.stat_name: VALUE
-        stat_part, _, value_str = line.rpartition(":")
-        try:
-            count = int(value_str.strip())
-        except ValueError:
-            continue
-        parts = stat_part.split("|")
-        if len(parts) < 3:
-            continue
-        subset = parts[2]
-        if not subset:
-            continue
-        if subset not in results:
-            results[subset] = {"completed": 0, "5xx": 0}
-        if "upstream_rq_completed" in stat_part:
-            results[subset]["completed"] = count
-        elif "upstream_rq_5xx" in stat_part:
-            results[subset]["5xx"] = count
-    return results
-
-
 def generate_mesh_traffic(app_label, svc_name, num_requests=300):
     """
     Generate HTTP traffic through the Istio mesh by exec-ing into an existing
@@ -279,24 +240,23 @@ def cleanup_and_wait():
 # ======================================================================
 # F1: CANARY TRAFFIC ROUTING (20%)
 #
-# Uses Envoy sidecar stats to verify canary receives ~10% traffic.
-# This is more reliable than Prometheus as it doesn't depend on scrape
-# timing or telemetry extension availability.
+# Uses Prometheus istio_requests_total metrics to verify traffic split.
+# The Telemetry CRD enables metric export from Envoy sidecars.
 # ======================================================================
 
 def check_f1_canary_traffic_routing(app_label, svc_name):
     """
     F1: Canary Traffic Routing — Functional test
 
-    Uses Envoy sidecar stats to verify canary receives ~10% traffic.
+    Uses Prometheus istio_requests_total to verify canary receives ~10% traffic.
     Requires ALL of: correct DR labels, correct VS weights/subsets, sidecar injection,
-    EnvoyFilter removal, stable label fix.
+    EnvoyFilter removal, stable label fix, canary pod in Service endpoints.
 
     4 checks:
     1. Canary pods exist with version: canary label AND istio-proxy sidecar
-    2. Envoy stats show canary subset received requests (any traffic at all)
+    2. Prometheus shows canary request rate > 0 (canary receives ANY traffic)
     3. Canary receives approximately 10% of total traffic (5-18% tolerance)
-    4. No 5xx errors in canary responses (EnvoyFilter removed)
+    4. No 503 errors in canary responses (EnvoyFilter removed)
     """
     print("\n--- F1: Canary Traffic Routing ---")
     checks_passed = 0
@@ -330,58 +290,69 @@ def check_f1_canary_traffic_routing(app_label, svc_name):
         print(f"  [FAIL] Check 1: canary pods with sidecar={canary_with_sidecar}, "
               f"ready without sidecar={canary_pods_ready}")
 
-    # Find a mesh pod for traffic generation and Envoy stats
-    exec_pod = _find_mesh_pod(app_label)
-    port = _discover_svc_port(svc_name)
-
-    if not exec_pod:
-        print("  [FAIL] Checks 2-4: No mesh pod found for traffic verification")
-        score = 1.0 if checks_passed == total else 0.0
-        print(f"{'PASSED' if score == 1.0 else 'FAILED'} F1 ({checks_passed}/{total})")
-        return score
-
-    # Read Envoy stats BEFORE traffic
-    before = _read_envoy_subset_stats(exec_pod, port)
-
-    # Generate traffic through the mesh
+    # Generate traffic so Prometheus has data to query
     generate_mesh_traffic(app_label, svc_name, num_requests=300)
-    time.sleep(5)
+    print("  Waiting 30s for Prometheus scrape cycle...")
+    time.sleep(30)
 
-    # Read Envoy stats AFTER traffic
-    after = _read_envoy_subset_stats(exec_pod, port)
+    # Try multiple Prometheus query patterns for canary rate
+    canary_rate = 0.0
+    for query in [
+        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",reporter="destination"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",reporter="destination"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary"}}[5m]))',
+    ]:
+        canary_rate = prom_query_value(query)
+        if canary_rate > 0:
+            break
 
-    # Calculate deltas
-    canary_rq = after.get("canary", {}).get("completed", 0) - before.get("canary", {}).get("completed", 0)
-    stable_rq = after.get("stable", {}).get("completed", 0) - before.get("stable", {}).get("completed", 0)
-    total_rq = canary_rq + stable_rq
-    canary_5xx = after.get("canary", {}).get("5xx", 0) - before.get("canary", {}).get("5xx", 0)
-
-    print(f"  Envoy stats delta: canary={canary_rq}, stable={stable_rq}, total={total_rq}, canary_5xx={canary_5xx}")
-
-    # Check 2: Canary received ANY traffic
-    if canary_rq > 0:
-        print(f"  [PASS] Check 2: Canary received {canary_rq} requests")
+    # Check 2: Canary request rate > 0
+    if canary_rate > 0:
+        print(f"  [PASS] Check 2: Canary request rate = {canary_rate:.4f} req/s")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 2: Canary received 0 requests")
+        print(f"  [FAIL] Check 2: Canary request rate = 0 (no traffic reaching canary)")
 
-    # Check 3: Canary approximately 10% (5-18%)
-    if total_rq > 0 and canary_rq > 0:
-        canary_pct = (canary_rq / total_rq) * 100
+    # Try multiple Prometheus query patterns for total rate
+    total_rate = 0.0
+    for query in [
+        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",reporter="destination"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_app="{app_label}",reporter="destination"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_app="{app_label}"}}[5m]))',
+    ]:
+        total_rate = prom_query_value(query)
+        if total_rate > 0:
+            break
+
+    # Check 3: Canary is approximately 10% of total (5-18%)
+    if total_rate > 0 and canary_rate > 0:
+        canary_pct = (canary_rate / total_rate) * 100
         if 5.0 <= canary_pct <= 18.0:
             print(f"  [PASS] Check 3: Canary ratio = {canary_pct:.1f}% (within 5-18%)")
             checks_passed += 1
         else:
             print(f"  [FAIL] Check 3: Canary ratio = {canary_pct:.1f}% (outside 5-18%)")
     else:
-        print(f"  [FAIL] Check 3: Cannot compute ratio (total={total_rq}, canary={canary_rq})")
+        print(f"  [FAIL] Check 3: Cannot compute ratio "
+              f"(total={total_rate:.4f}, canary={canary_rate:.4f})")
 
-    # Check 4: No 5xx errors for canary
-    if canary_5xx == 0:
-        print(f"  [PASS] Check 4: No 5xx errors for canary traffic")
+    # Check 4: No 503 errors for canary
+    error_rate = 0.0
+    for query in [
+        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code="503"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",response_code="503"}}[5m]))',
+    ]:
+        error_rate = prom_query_value(query)
+        if error_rate > 0:
+            break
+
+    if error_rate == 0:
+        print(f"  [PASS] Check 4: No 503 errors for canary in Prometheus")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 4: Canary 5xx errors = {canary_5xx}")
+        print(f"  [FAIL] Check 4: Canary 503 error rate = {error_rate:.4f} req/s")
 
     score = 1.0 if checks_passed == total else 0.0
     print(f"{'PASSED' if score == 1.0 else 'FAILED'} F1 ({checks_passed}/{total})")
@@ -415,14 +386,19 @@ def check_f2_gitops_convergence(app_label):
         "-o", "jsonpath={.status.sync.status}",
         namespace="argocd",
     )
-    if rc == 0 and sync_out.strip() == "Synced":
-        print(f"  [PASS] Check 1: ArgoCD sync status = Synced")
-        checks_passed += 1
+    if rc == 0 and sync_out.strip() in ("Synced", "OutOfSync"):
+        # Accept Synced or OutOfSync (live resources may differ due to mutation webhooks)
+        # The key is that the app source path is correct and points to valid manifests
+        if sync_out.strip() == "Synced":
+            print(f"  [PASS] Check 1: ArgoCD sync status = Synced")
+            checks_passed += 1
+        else:
+            print(f"  [FAIL] Check 1: ArgoCD sync status = '{sync_out.strip()}' (expected Synced)")
     else:
         print(f"  [FAIL] Check 1: ArgoCD sync status = '{sync_out.strip()}' (expected Synced)")
 
     # Check 2: ArgoCD app health status
-    # For apps managing only Istio CRDs, health may be empty — acceptable
+    # For apps managing only Istio CRDs, health may be empty or Healthy
     health_out, rc = run_kubectl(
         "get", "application", "bleater-traffic-management",
         "-o", "jsonpath={.status.health.status}",
@@ -700,96 +676,68 @@ def check_f5_canary_golden_signals(app_label, svc_name):
     """
     F5: Canary Golden Signals — Integration test
 
-    Verifies observability signals (Prometheus metrics, Jaeger traces, Envoy stats)
-    confirm canary traffic is flowing correctly. Ultimate integration test — only
-    passes when ALL other fixes work AND telemetry is functional.
+    Verifies Prometheus metrics and Jaeger traces confirm canary traffic.
+    Ultimate integration test — only passes when ALL other fixes work.
 
     4 checks:
-    1. Canary traffic confirmed via Envoy stats or Prometheus (rate > 0)
+    1. Prometheus istio_requests_total for canary > 0
     2. Canary ratio approximately 10% (5-20% tolerance)
-    3. Jaeger traces exist for the service (or Envoy stats confirm canary traffic)
-    4. No 5xx errors for canary in Envoy stats or Prometheus
+    3. Jaeger traces exist for the service
+    4. No 503 responses for canary in Prometheus
     """
     print("\n--- F5: Canary Golden Signals ---")
     checks_passed = 0
     total = 4
 
-    # Find mesh pod and get port
-    exec_pod = _find_mesh_pod(app_label)
-    port = _discover_svc_port(svc_name)
-
-    # Read Envoy stats BEFORE
-    before = _read_envoy_subset_stats(exec_pod, port) if exec_pod else {}
-
-    # Generate traffic
+    # Generate more traffic for fresh metrics
     generate_mesh_traffic(app_label, svc_name, num_requests=200)
-    print("  Waiting 30s for Prometheus scrape and trace collection...")
+    print("  Waiting 30s for Prometheus scrape cycle...")
     time.sleep(30)
 
-    # Read Envoy stats AFTER
-    after = _read_envoy_subset_stats(exec_pod, port) if exec_pod else {}
+    # Try multiple query patterns for canary
+    canary_rate = 0.0
+    for query in [
+        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",reporter="destination"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",reporter="destination"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary"}}[5m]))',
+    ]:
+        canary_rate = prom_query_value(query)
+        if canary_rate > 0:
+            break
 
-    # Calculate Envoy deltas
-    canary_rq = after.get("canary", {}).get("completed", 0) - before.get("canary", {}).get("completed", 0)
-    stable_rq = after.get("stable", {}).get("completed", 0) - before.get("stable", {}).get("completed", 0)
-    total_rq = canary_rq + stable_rq
-    canary_5xx = after.get("canary", {}).get("5xx", 0) - before.get("canary", {}).get("5xx", 0)
-
-    # Also try Prometheus (may or may not have istio_requests_total)
-    prom_canary_rate = prom_query_value(
-        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",'
-        f'destination_version="canary",reporter="destination"}}[5m]))'
-    )
-    if prom_canary_rate == 0:
-        prom_canary_rate = prom_query_value(
-            f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",'
-            f'destination_version="canary"}}[5m]))'
-        )
-    prom_total_rate = prom_query_value(
-        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",'
-        f'reporter="destination"}}[5m]))'
-    )
-    if prom_total_rate == 0:
-        prom_total_rate = prom_query_value(
-            f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}"}}[5m]))'
-        )
-
-    print(f"  Envoy stats delta: canary={canary_rq}, stable={stable_rq}, canary_5xx={canary_5xx}")
-    print(f"  Prometheus: canary_rate={prom_canary_rate:.4f}, total_rate={prom_total_rate:.4f}")
-
-    # Check 1: Canary traffic > 0 (Prometheus preferred, Envoy fallback)
-    if prom_canary_rate > 0:
-        print(f"  [PASS] Check 1: Prometheus canary rate = {prom_canary_rate:.4f} req/s")
-        checks_passed += 1
-    elif canary_rq > 0:
-        print(f"  [PASS] Check 1: Envoy confirms canary received {canary_rq} requests "
-              f"(Prometheus unavailable)")
+    # Check 1: Canary request rate > 0
+    if canary_rate > 0:
+        print(f"  [PASS] Check 1: Canary request rate = {canary_rate:.4f} req/s")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 1: No canary traffic detected (Prometheus={prom_canary_rate}, Envoy={canary_rq})")
+        print(f"  [FAIL] Check 1: Canary request rate = 0")
+
+    # Try multiple query patterns for total
+    total_rate = 0.0
+    for query in [
+        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",reporter="destination"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_app="{app_label}",reporter="destination"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_app="{app_label}"}}[5m]))',
+    ]:
+        total_rate = prom_query_value(query)
+        if total_rate > 0:
+            break
 
     # Check 2: Canary ratio approximately 10% (5-20%)
-    ratio_passed = False
-    if prom_total_rate > 0 and prom_canary_rate > 0:
-        canary_pct = (prom_canary_rate / prom_total_rate) * 100
+    if total_rate > 0 and canary_rate > 0:
+        canary_pct = (canary_rate / total_rate) * 100
         if 5.0 <= canary_pct <= 20.0:
-            print(f"  [PASS] Check 2: Prometheus canary ratio = {canary_pct:.1f}% (within 5-20%)")
-            ratio_passed = True
+            print(f"  [PASS] Check 2: Canary ratio = {canary_pct:.1f}% (within 5-20%)")
+            checks_passed += 1
         else:
-            print(f"  [FAIL] Check 2: Prometheus canary ratio = {canary_pct:.1f}% (outside 5-20%)")
-    if not ratio_passed and total_rq > 0 and canary_rq > 0:
-        canary_pct = (canary_rq / total_rq) * 100
-        if 5.0 <= canary_pct <= 20.0:
-            print(f"  [PASS] Check 2: Envoy canary ratio = {canary_pct:.1f}% (within 5-20%)")
-            ratio_passed = True
-        elif not (prom_total_rate > 0 and prom_canary_rate > 0):
-            print(f"  [FAIL] Check 2: Envoy canary ratio = {canary_pct:.1f}% (outside 5-20%)")
-    if not ratio_passed and not (prom_total_rate > 0 or total_rq > 0):
-        print(f"  [FAIL] Check 2: No traffic data available")
-    if ratio_passed:
-        checks_passed += 1
+            print(f"  [FAIL] Check 2: Canary ratio = {canary_pct:.1f}% (outside 5-20%)")
+    else:
+        print(f"  [FAIL] Check 2: Cannot compute ratio "
+              f"(total={total_rate:.4f}, canary={canary_rate:.4f})")
 
-    # Check 3: Jaeger traces or Envoy stats confirm traffic
+    # Check 3: Jaeger has traces for the service
     jaeger_urls = [
         "http://jaeger-query.monitoring.svc.cluster.local:16686",
         "http://jaeger.monitoring.svc.cluster.local:16686",
@@ -798,54 +746,64 @@ def check_f5_canary_golden_signals(app_label, svc_name):
     any_traces_found = False
     canary_traces_found = False
 
-    for jaeger_url in jaeger_urls:
-        try:
-            search_url = f"{jaeger_url}/api/traces?service={svc_name}&limit=50&lookback=1h"
-            req = urllib.request.Request(search_url, method="GET")
-            resp = urllib.request.urlopen(req, timeout=10)
-            data = json.loads(resp.read().decode())
-            trace_data = data.get("data", [])
-            if trace_data:
-                any_traces_found = True
-                for trace in trace_data:
-                    trace_json = json.dumps(trace)
-                    if "canary" in trace_json.lower():
-                        canary_traces_found = True
-                        break
-            if any_traces_found:
-                break
-        except Exception:
-            continue
+    # Try with both service name patterns
+    for svc_query in [svc_name, app_label]:
+        for jaeger_url in jaeger_urls:
+            try:
+                search_url = f"{jaeger_url}/api/traces?service={svc_query}&limit=50&lookback=1h"
+                req = urllib.request.Request(search_url, method="GET")
+                resp = urllib.request.urlopen(req, timeout=10)
+                data = json.loads(resp.read().decode())
+                trace_data = data.get("data", [])
+                if trace_data:
+                    any_traces_found = True
+                    for trace in trace_data:
+                        trace_json = json.dumps(trace)
+                        if "canary" in trace_json.lower():
+                            canary_traces_found = True
+                            break
+                if any_traces_found:
+                    break
+            except Exception:
+                continue
+        if any_traces_found:
+            break
 
     if canary_traces_found:
         print(f"  [PASS] Check 3: Jaeger traces found with canary endpoint")
         checks_passed += 1
-    elif any_traces_found and canary_rq > 0:
-        print(f"  [PASS] Check 3: Jaeger has traces for {svc_name}, "
-              f"Envoy confirms canary traffic ({canary_rq} requests)")
-        checks_passed += 1
-    elif canary_rq > 0:
-        print(f"  [PASS] Check 3: Envoy confirms canary traffic ({canary_rq} requests), "
-              f"Jaeger unavailable")
-        checks_passed += 1
+    elif any_traces_found:
+        if canary_rate > 0:
+            # Jaeger may not tag version explicitly. If Prometheus confirms canary traffic
+            # and Jaeger has traces for the service, the observability stack is working
+            print(f"  [PASS] Check 3: Jaeger has traces and Prometheus confirms canary traffic")
+            checks_passed += 1
+        else:
+            print(f"  [FAIL] Check 3: Jaeger has traces but no canary traffic confirmed")
     else:
-        print(f"  [FAIL] Check 3: No canary traffic evidence "
-              f"(traces={any_traces_found}, envoy_canary={canary_rq})")
+        if canary_rate > 0:
+            # Jaeger unavailable but Prometheus confirms canary — partial credit
+            print(f"  [PASS] Check 3: Prometheus confirms canary traffic "
+                  f"(rate={canary_rate:.4f}), Jaeger unavailable")
+            checks_passed += 1
+        else:
+            print(f"  [FAIL] Check 3: No traces and no canary traffic confirmed")
 
-    # Check 4: No 5xx errors for canary
-    prom_error_rate = prom_query_value(
-        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",'
-        f'destination_version="canary",response_code="503"}}[5m]))'
-    )
-    if prom_error_rate == 0 and canary_5xx == 0:
-        print(f"  [PASS] Check 4: No 5xx errors for canary (Prometheus + Envoy)")
-        checks_passed += 1
-    elif canary_5xx == 0:
-        print(f"  [PASS] Check 4: No 5xx errors for canary in Envoy stats")
+    # Check 4: No 503 errors for canary
+    error_rate = 0.0
+    for query in [
+        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code="503"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",response_code="503"}}[5m]))',
+    ]:
+        error_rate = prom_query_value(query)
+        if error_rate > 0:
+            break
+
+    if error_rate == 0:
+        print(f"  [PASS] Check 4: No 503 errors for canary in Prometheus")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 4: Canary 5xx errors: Envoy={canary_5xx}, "
-              f"Prometheus={prom_error_rate:.4f}")
+        print(f"  [FAIL] Check 4: Canary 503 error rate = {error_rate:.4f} req/s")
 
     score = 1.0 if checks_passed == total else 0.0
     print(f"{'PASSED' if score == 1.0 else 'FAILED'} F5 ({checks_passed}/{total})")

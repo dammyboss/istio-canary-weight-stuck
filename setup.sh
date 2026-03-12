@@ -222,7 +222,8 @@ spec:
       - name: bleat-service
         image: ${BLEAT_IMAGE}
         ports:
-        - containerPort: ${BLEAT_PORT}
+        - name: http
+          containerPort: ${BLEAT_PORT}
           protocol: TCP
         env:
         - name: CANARY_VERSION
