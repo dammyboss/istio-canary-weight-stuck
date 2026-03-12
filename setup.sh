@@ -394,11 +394,21 @@ until kubectl get pods -n gitea -l app=gitea -o jsonpath='{.items[0].status.phas
     sleep 5
     ELAPSED=$((ELAPSED + 5))
 done
+
+# Discover Gitea service ClusterIP (dnsmasq maps gitea.devops.local to nginx, not Gitea directly)
+GITEA_SVC_IP=$(kubectl get svc -n gitea -l app=gitea -o jsonpath='{.items[0].spec.clusterIP}' 2>/dev/null)
+if [ -z "$GITEA_SVC_IP" ]; then
+    GITEA_SVC_IP=$(kubectl get svc gitea-http -n gitea -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
+fi
+GITEA_SVC_IP=${GITEA_SVC_IP:-"gitea-http.gitea.svc.cluster.local"}
+GITEA_HOST="${GITEA_SVC_IP}:3000"
+echo "  Gitea service endpoint: ${GITEA_HOST}"
+
 # Wait for Gitea HTTP to actually respond
 ELAPSED=0
-until curl -sf -o /dev/null http://gitea.devops.local:3000/ 2>/dev/null; do
-    if [ $ELAPSED -ge 120 ]; then
-        echo "Error: Gitea HTTP not responding after 120s"
+until curl -sf -o /dev/null "http://${GITEA_HOST}/" 2>/dev/null; do
+    if [ $ELAPSED -ge 180 ]; then
+        echo "Error: Gitea HTTP not responding after 180s at ${GITEA_HOST}"
         exit 1
     fi
     sleep 5
@@ -417,7 +427,7 @@ except: print('password')
 " 2>/dev/null)
 GITEA_PASS_ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${GITEA_PASS}', safe=''))")
 GITEA_CRED="root:${GITEA_PASS_ENC}"
-GITEA_API="http://${GITEA_CRED}@gitea.devops.local:3000/api/v1"
+GITEA_API="http://${GITEA_CRED}@${GITEA_HOST}/api/v1"
 
 echo "  Gitea credentials retrieved"
 
@@ -433,7 +443,7 @@ sleep 3
 # Clone and populate the repo with broken manifests
 TMPDIR=$(mktemp -d)
 cd "$TMPDIR"
-git clone "http://${GITEA_CRED}@gitea.devops.local:3000/root/bleater-istio-config.git" repo 2>/dev/null
+git clone "http://${GITEA_CRED}@${GITEA_HOST}/root/bleater-istio-config.git" repo 2>/dev/null
 cd repo
 
 git config user.email "platform-team@bleater.dev"
