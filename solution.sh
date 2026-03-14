@@ -179,6 +179,15 @@ echo ""
 
 echo "Step 7: Fixing GitOps pipeline..."
 
+# Discover Gitea ClusterIP (dnsmasq maps gitea.devops.local to nginx, not Gitea directly)
+GITEA_SVC_IP=$(kubectl get svc gitea -n gitea -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
+if [ -z "$GITEA_SVC_IP" ]; then
+    GITEA_SVC_IP=$(kubectl get svc -n gitea -l app=gitea -o jsonpath='{.items[0].spec.clusterIP}' 2>/dev/null)
+fi
+GITEA_SVC_IP=${GITEA_SVC_IP:-"10.43.79.1"}
+GITEA_HOST="${GITEA_SVC_IP}:3000"
+echo "  Gitea endpoint: ${GITEA_HOST}"
+
 # Get Gitea credentials
 GITEA_PASS=$(python3 -c "
 import urllib.request, re
@@ -194,7 +203,7 @@ GITEA_CRED="root:${GITEA_PASS_ENC}"
 # Clone and fix the Gitea repo
 TMPDIR=$(mktemp -d)
 cd "$TMPDIR"
-git clone "http://${GITEA_CRED}@gitea.devops.local:3000/root/bleater-istio-config.git" repo 2>/dev/null
+git clone "http://${GITEA_CRED}@${GITEA_HOST}/root/bleater-istio-config.git" repo 2>/dev/null
 cd repo
 
 git config user.email "platform-team@bleater.dev"

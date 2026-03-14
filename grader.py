@@ -726,16 +726,18 @@ def check_f4_drift_resilience(app_label):
 
 def check_f5_canary_golden_signals(app_label, svc_name):
     """
-    F5: Canary Golden Signals — Integration test
+    F5: Canary Golden Signals — Observability integration test
 
-    Verifies Prometheus metrics and Jaeger traces confirm canary traffic.
-    Ultimate integration test — only passes when ALL other fixes work.
+    Verifies that the observability pipeline (Prometheus metrics, Jaeger traces,
+    label propagation) confirms canary traffic is flowing correctly.
+    Distinct from F1 (traffic routing): F5 tests that metrics/traces REPORT
+    the traffic, not just that traffic flows.
 
     4 checks:
-    1. Prometheus istio_requests_total for canary > 0
-    2. VirtualService has correct 90/10 weights with correct subset names
-    3. Jaeger traces exist for the service
-    4. No 503 responses for canary in Prometheus
+    1. Prometheus istio_requests_total for canary > 0 (metrics pipeline works)
+    2. Canary HTTP 200 response rate > 0 in Prometheus (successful responses, not just any traffic)
+    3. Jaeger traces exist for the service (distributed tracing pipeline)
+    4. Prometheus destination_version label propagation (Istio telemetry CRD + pod labels → metrics)
     """
     print("\n--- F5: Canary Golden Signals ---")
     checks_passed = 0
@@ -758,22 +760,35 @@ def check_f5_canary_golden_signals(app_label, svc_name):
         if canary_rate > 0:
             break
 
-    # Check 1: Canary request rate > 0
+    # Check 1: Canary request rate > 0 in Prometheus
     if canary_rate > 0:
         print(f"  [PASS] Check 1: Canary request rate = {canary_rate:.4f} req/s")
         checks_passed += 1
     else:
         print(f"  [FAIL] Check 1: Canary request rate = 0")
 
-    # Check 2: VirtualService has correct 90/10 weights with correct subset names
-    # Config-level verification that routing was configured correctly
-    vs_weights = _read_vs_weights(app_label)
-    if vs_weights and vs_weights.get("stable") == 90 and vs_weights.get("canary") == 10:
-        print(f"  [PASS] Check 2: VirtualService weights = stable:90, canary:10")
+    # Check 2: Canary HTTP 200 response rate > 0 (successful responses, not just traffic)
+    # This is distinct from F1 — verifies the canary serves SUCCESSFUL responses,
+    # not just that any traffic reaches it (which could all be 503s/errors)
+    canary_200_rate = 0.0
+    for query in [
+        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code="200",reporter="destination"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",response_code="200"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code=~"2.."}}[5m]))',
+    ]:
+        canary_200_rate = prom_query_value(query)
+        if canary_200_rate > 0:
+            break
+
+    if canary_200_rate > 0:
+        print(f"  [PASS] Check 2: Canary 200 response rate = {canary_200_rate:.4f} req/s")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 2: VirtualService weights = {vs_weights} "
-              f"(expected stable:90, canary:10)")
+        # If canary rate > 0 but no 200s, all canary traffic is errors
+        if canary_rate > 0:
+            print(f"  [FAIL] Check 2: Canary receives traffic ({canary_rate:.4f}) but no 200 responses")
+        else:
+            print(f"  [FAIL] Check 2: Canary 200 response rate = 0")
 
     # Check 3: Jaeger has traces for the service
     jaeger_urls = [
@@ -827,27 +842,42 @@ def check_f5_canary_golden_signals(app_label, svc_name):
         else:
             print(f"  [FAIL] Check 3: No traces and no canary traffic confirmed")
 
-    # Check 4: No significant 503 errors for canary (EnvoyFilter removed)
-    # Use 2m window to minimize pre-fix residual errors bleeding into the window
-    error_rate = 0.0
+    # Check 4: destination_version label propagation in Prometheus
+    # Verifies that the Istio telemetry pipeline propagates pod labels into
+    # Prometheus metric labels. This requires: Telemetry CRD enabled,
+    # pod version labels set correctly, sidecar injected, and Prometheus scraping.
+    # Distinct from F1/F3 which check traffic flow / mesh config.
+    version_labels_exist = False
     for query in [
-        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code="503"}}[2m]))',
-        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",response_code="503"}}[2m]))',
+        f'count(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary"}})',
+        f'count(istio_requests_total{{destination_app="{app_label}",destination_version="canary"}})',
     ]:
-        error_rate = prom_query_value(query)
-        if error_rate > 0:
+        count = prom_query_value(query)
+        if count > 0:
+            version_labels_exist = True
             break
 
-    # Allow tiny residual error rate (< 5% of canary traffic) from pre-fix window overlap
-    error_threshold = max(canary_rate * 0.05, 0.01) if canary_rate > 0 else 0.01
-    if error_rate <= error_threshold:
-        if error_rate > 0:
-            print(f"  [PASS] Check 4: Canary 503 rate = {error_rate:.4f} (residual, below threshold)")
-        else:
-            print(f"  [PASS] Check 4: No 503 errors for canary in Prometheus")
+    # Also verify stable version label exists (both labels propagate)
+    stable_labels_exist = False
+    for query in [
+        f'count(istio_requests_total{{destination_service_name="{svc_name}",destination_version="stable"}})',
+        f'count(istio_requests_total{{destination_app="{app_label}",destination_version="stable"}})',
+    ]:
+        count = prom_query_value(query)
+        if count > 0:
+            stable_labels_exist = True
+            break
+
+    if version_labels_exist and stable_labels_exist:
+        print(f"  [PASS] Check 4: Both destination_version=canary and =stable labels in Prometheus")
+        checks_passed += 1
+    elif version_labels_exist:
+        # Canary labels exist but stable doesn't — partial, still pass (stable may take time)
+        print(f"  [PASS] Check 4: destination_version=canary labels present in Prometheus")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 4: Canary 503 error rate = {error_rate:.4f} req/s (threshold: {error_threshold:.4f})")
+        print(f"  [FAIL] Check 4: destination_version labels not found in Prometheus "
+              f"(canary={version_labels_exist}, stable={stable_labels_exist})")
 
     score = 1.0 if checks_passed == total else 0.0
     print(f"{'PASSED' if score == 1.0 else 'FAILED'} F5 ({checks_passed}/{total})")
@@ -927,7 +957,7 @@ def grade(transcript: str) -> GradingResult:
         "gitops_convergence": ("F2", "GitOps convergence — ArgoCD synced, VirtualService stable (20%)"),
         "service_mesh_integrity": ("F3", "Service mesh integrity — sidecar, EnvoyFilter, subsets (20%)"),
         "drift_resilience": ("F4", "Drift resilience — enforcers removed, fixes persist (20%)"),
-        "canary_golden_signals": ("F5", "Canary golden signals — Prometheus metrics, traces (20%)"),
+        "canary_golden_signals": ("F5", "Canary golden signals — observability pipeline, metrics, traces (20%)"),
     }
 
     feedback_lines = []

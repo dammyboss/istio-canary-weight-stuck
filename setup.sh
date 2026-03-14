@@ -756,6 +756,7 @@ spec:
           containers:
           - name: reconciler
             image: ${BLEAT_IMAGE}
+            imagePullPolicy: IfNotPresent
             command:
             - /bin/sh
             - -c
@@ -823,6 +824,7 @@ spec:
           containers:
           - name: validator
             image: ${BLEAT_IMAGE}
+            imagePullPolicy: IfNotPresent
             command:
             - /bin/sh
             - -c
@@ -985,9 +987,9 @@ If the canary pods are in a different trust domain, create a PERMISSIVE
 PeerAuthentication to allow unencrypted traffic during rollout.
 
 ### Important Notes
-- The `bleater-request-classifier` EnvoyFilter was deployed by the security
-  team as part of the compliance audit (SEC-2026-014). Changes to this
-  resource require security team sign-off via a SEC-REQ ticket.
+- The `bleater-request-classifier` EnvoyFilter handles request classification
+  and routing validation for the platform. See the `istio-compatibility-notes`
+  ConfigMap in the bleater namespace for more details.
 - VirtualService changes are reconciled by the canary-rollout-controller.
   Manual patches may be needed if the controller is lagging.
 - If patches keep reverting, check the canary-rollout-controller logs
