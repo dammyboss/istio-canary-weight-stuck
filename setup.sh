@@ -626,135 +626,235 @@ echo "  B9: ArgoCD selfHeal enabled (reverts kubectl patches)"
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════
-# PHASE 5: DRIFT ENFORCERS (B10, B11)
+# PHASE 5: DRIFT ENFORCERS (B10, B11) — K8s CronJobs
 # ══════════════════════════════════════════════════════════════════════════
 
 echo "Phase 5: Installing drift enforcement agents..."
 
-# B10: Cron job that re-applies broken state every 2 minutes
+# Create ServiceAccount + RBAC for drift enforcer CronJobs
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: drift-enforcer
+  namespace: $NS
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+    app.kubernetes.io/component: drift-enforcement
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: drift-enforcer-admin
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: drift-enforcer
+  namespace: $NS
+EOF
+echo "  Drift enforcer ServiceAccount + RBAC created"
+
+# Store the EnvoyFilter manifest in a ConfigMap for re-application by B11
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: istio-mesh-validator-data
+  namespace: $NS
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+    app.kubernetes.io/component: drift-enforcement
+data:
+  envoyfilter.yaml: |
+    apiVersion: networking.istio.io/v1alpha3
+    kind: EnvoyFilter
+    metadata:
+      name: bleater-request-classifier
+      namespace: ${NS}
+      labels:
+        app.kubernetes.io/managed-by: platform-security
+        app.kubernetes.io/component: request-classification
+      annotations:
+        platform.bleater.io/purpose: "Request classification and routing validation"
+    spec:
+      workloadSelector:
+        labels:
+          app: ${STABLE_APP_LABEL}
+      configPatches:
+      - applyTo: HTTP_FILTER
+        match:
+          context: SIDECAR_OUTBOUND
+          listener:
+            filterChain:
+              filter:
+                name: envoy.filters.network.http_connection_manager
+                subFilter:
+                  name: envoy.filters.http.router
+        patch:
+          operation: INSERT_BEFORE
+          value:
+            name: envoy.filters.http.lua
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+              inline_code: |
+                function envoy_on_request(request_handle)
+                  local cluster = request_handle:headers():get("x-envoy-decorator-overwrite")
+                  if cluster then
+                    local match = string.find(cluster, "canary")
+                    if match then
+                      request_handle:logInfo("request-classifier: validating canary routing integrity")
+                      local subset_header = request_handle:headers():get("x-istio-attributes")
+                      if not subset_header or not string.find(tostring(subset_header), "version") then
+                        request_handle:respond(
+                          {[":status"] = "503"},
+                          "upstream connect error or disconnect/reset before headers. retried and the latest reset reason: remote connection failure, transport failure reason: TLS handshake timeout"
+                        )
+                      end
+                    end
+                  end
+                end
+EOF
+echo "  EnvoyFilter manifest stored in ConfigMap"
+
+# B10: CronJob that re-applies broken state every 2 minutes
 # - Patches DestinationRule canary subset selector back to version: canary
 # - Removes version: canary label from canary pods
 # - Re-adds sidecar.istio.io/inject: false to canary deployment
-cat > /usr/local/bin/istio-config-reconciler.sh <<RECONCILEREOF
-#!/bin/bash
-export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-# Reconcile DestinationRule subset selectors to match policy
-/usr/local/bin/kubectl patch destinationrule bleat-service -n ${NS} --type=json \
-    -p='[{"op":"replace","path":"/spec/subsets/1/labels","value":{"version":"canary"}}]' 2>/dev/null
-# Remove non-policy labels from canary workloads
-for pod in \$(/usr/local/bin/kubectl get pods -n ${NS} -l app=${STABLE_APP_LABEL},track=canary -o name 2>/dev/null); do
-    /usr/local/bin/kubectl label \$pod -n ${NS} version- 2>/dev/null
-done
-# Ensure sidecar injection policy compliance on canary deployment
-/usr/local/bin/kubectl patch deployment ${BLEAT_DEPLOY}-canary -n ${NS} --type=json \
-    -p='[{"op":"add","path":"/spec/template/metadata/annotations/sidecar.istio.io~1inject","value":"false"}]' 2>/dev/null
-echo "[\$(date -u +%FT%TZ)] istio-config-reconciler: reconciliation complete"
-RECONCILEREOF
-chmod +x /usr/local/bin/istio-config-reconciler.sh
-
-cat > /etc/cron.d/istio-config-reconciler <<'CRONEOF'
-SHELL=/bin/bash
-KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-*/2 * * * * root /usr/local/bin/istio-config-reconciler.sh >> /var/log/istio-reconciler.log 2>&1
-CRONEOF
-chmod 644 /etc/cron.d/istio-config-reconciler
-
-# Ensure cron is running
-service cron start 2>/dev/null || true
-
-echo "  B10: Cron job istio-config-reconciler installed (every 2 min)"
+kubectl apply -f - <<EOF
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: istio-config-reconciler
+  namespace: $NS
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+    app.kubernetes.io/component: drift-enforcement
+  annotations:
+    platform.bleater.io/purpose: "Reconcile Istio configuration to match policy"
+spec:
+  schedule: "*/2 * * * *"
+  concurrencyPolicy: Replace
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 90
+      template:
+        spec:
+          serviceAccountName: drift-enforcer
+          restartPolicy: Never
+          volumes:
+          - name: kubectl-bin
+            hostPath:
+              path: /usr/local/bin/kubectl
+              type: File
+          containers:
+          - name: reconciler
+            image: ${BLEAT_IMAGE}
+            command:
+            - /bin/sh
+            - -c
+            - |
+              # Reconcile DestinationRule subset selectors to match policy
+              /host-bin/kubectl patch destinationrule bleat-service -n ${NS} --type=json \
+                -p='[{"op":"replace","path":"/spec/subsets/1/labels","value":{"version":"canary"}}]' 2>/dev/null || true
+              # Remove non-policy labels from canary workloads
+              for pod in \$(/host-bin/kubectl get pods -n ${NS} -l app=${STABLE_APP_LABEL},track=canary -o name 2>/dev/null); do
+                /host-bin/kubectl label \$pod -n ${NS} version- 2>/dev/null || true
+              done
+              # Ensure sidecar injection policy compliance on canary deployment
+              /host-bin/kubectl patch deployment ${BLEAT_DEPLOY}-canary -n ${NS} --type=json \
+                -p='[{"op":"add","path":"/spec/template/metadata/annotations/sidecar.istio.io~1inject","value":"false"}]' 2>/dev/null || true
+              echo "reconciliation complete"
+            volumeMounts:
+            - name: kubectl-bin
+              mountPath: /host-bin/kubectl
+              readOnly: true
+            resources:
+              requests:
+                cpu: 10m
+                memory: 32Mi
+              limits:
+                cpu: 100m
+                memory: 64Mi
+EOF
+echo "  B10: CronJob istio-config-reconciler installed (every 2 min)"
 echo "        - Reverts DestinationRule subset labels"
 echo "        - Removes version label from canary pods"
 echo "        - Re-adds sidecar inject: false to canary deployment"
 
-# B11: Cron job that enforces VirtualService weights + re-applies EnvoyFilter every 3 minutes
-# Store the EnvoyFilter manifest for re-application
-mkdir -p /var/lib/istio-mesh-validator
-cat > /var/lib/istio-mesh-validator/envoyfilter.yaml <<EFMANIFEST
-apiVersion: networking.istio.io/v1alpha3
-kind: EnvoyFilter
+# B11: CronJob that enforces VirtualService weights + re-applies EnvoyFilter every 3 minutes
+kubectl apply -f - <<EOF
+apiVersion: batch/v1
+kind: CronJob
 metadata:
-  name: bleater-request-classifier
-  namespace: ${NS}
+  name: istio-mesh-validator
+  namespace: $NS
   labels:
-    app.kubernetes.io/managed-by: platform-security
-    app.kubernetes.io/component: request-classification
+    app.kubernetes.io/managed-by: platform-ops
+    app.kubernetes.io/component: drift-enforcement
   annotations:
-    platform.bleater.io/purpose: "Request classification and routing validation"
+    platform.bleater.io/purpose: "Validate and enforce mesh configuration integrity"
 spec:
-  workloadSelector:
-    labels:
-      app: ${STABLE_APP_LABEL}
-  configPatches:
-  - applyTo: HTTP_FILTER
-    match:
-      context: SIDECAR_OUTBOUND
-      listener:
-        filterChain:
-          filter:
-            name: envoy.filters.network.http_connection_manager
-            subFilter:
-              name: envoy.filters.http.router
-    patch:
-      operation: INSERT_BEFORE
-      value:
-        name: envoy.filters.http.lua
-        typed_config:
-          "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
-          inline_code: |
-            function envoy_on_request(request_handle)
-              local cluster = request_handle:headers():get("x-envoy-decorator-overwrite")
-              if cluster then
-                local match = string.find(cluster, "canary")
-                if match then
-                  request_handle:logInfo("request-classifier: validating canary routing integrity")
-                  local subset_header = request_handle:headers():get("x-istio-attributes")
-                  if not subset_header or not string.find(tostring(subset_header), "version") then
-                    request_handle:respond(
-                      {[":status"] = "503"},
-                      "upstream connect error or disconnect/reset before headers. retried and the latest reset reason: remote connection failure, transport failure reason: TLS handshake timeout"
-                    )
-                  end
-                end
-              end
-            end
-EFMANIFEST
-
-cat > /usr/local/bin/istio-mesh-validator.sh <<VALIDATOREOF
-#!/bin/bash
-export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-# istio-mesh-validator: Mesh configuration integrity monitor
-# Validates VirtualService weights and EnvoyFilter configuration
-
-echo "[\$(date -u +%FT%TZ)] istio-mesh-validator: starting validation cycle"
-
-# Validate VirtualService weight policy (stable=100, canary-v2=0)
-CURRENT_WEIGHT=\$(/usr/local/bin/kubectl get virtualservice bleat-service -n ${NS} \
-    -o jsonpath='{.spec.http[0].route[0].weight}' 2>/dev/null)
-if [ "\$CURRENT_WEIGHT" != "100" ]; then
-    echo "  Weight drift detected (\$CURRENT_WEIGHT != 100), reconciling..."
-    /usr/local/bin/kubectl patch virtualservice bleat-service -n ${NS} --type=json \
-        -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},{"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]' 2>/dev/null
-fi
-
-# Validate EnvoyFilter exists (re-create if deleted)
-if ! /usr/local/bin/kubectl get envoyfilter bleater-request-classifier -n ${NS} &>/dev/null; then
-    echo "  EnvoyFilter missing, re-applying..."
-    /usr/local/bin/kubectl apply -f /var/lib/istio-mesh-validator/envoyfilter.yaml 2>/dev/null
-fi
-
-echo "[\$(date -u +%FT%TZ)] istio-mesh-validator: validation cycle complete"
-VALIDATOREOF
-chmod +x /usr/local/bin/istio-mesh-validator.sh
-
-cat > /etc/cron.d/istio-mesh-validator <<'CRONEOF'
-SHELL=/bin/bash
-KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-*/3 * * * * root /usr/local/bin/istio-mesh-validator.sh >> /var/log/istio-mesh-validator.log 2>&1
-CRONEOF
-chmod 644 /etc/cron.d/istio-mesh-validator
-
-echo "  B11: Cron job istio-mesh-validator installed (every 3 min)"
+  schedule: "*/3 * * * *"
+  concurrencyPolicy: Replace
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 90
+      template:
+        spec:
+          serviceAccountName: drift-enforcer
+          restartPolicy: Never
+          volumes:
+          - name: kubectl-bin
+            hostPath:
+              path: /usr/local/bin/kubectl
+              type: File
+          - name: validator-data
+            configMap:
+              name: istio-mesh-validator-data
+          containers:
+          - name: validator
+            image: ${BLEAT_IMAGE}
+            command:
+            - /bin/sh
+            - -c
+            - |
+              # Validate VirtualService weight policy (stable=100, canary-v2=0)
+              CURRENT_WEIGHT=\$(/host-bin/kubectl get virtualservice bleat-service -n ${NS} \
+                -o jsonpath='{.spec.http[0].route[0].weight}' 2>/dev/null)
+              if [ "\$CURRENT_WEIGHT" != "100" ]; then
+                /host-bin/kubectl patch virtualservice bleat-service -n ${NS} --type=json \
+                  -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},{"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]' 2>/dev/null || true
+              fi
+              # Validate EnvoyFilter exists (re-create if deleted)
+              if ! /host-bin/kubectl get envoyfilter bleater-request-classifier -n ${NS} &>/dev/null; then
+                /host-bin/kubectl apply -f /etc/validator/envoyfilter.yaml 2>/dev/null || true
+              fi
+              echo "validation complete"
+            volumeMounts:
+            - name: kubectl-bin
+              mountPath: /host-bin/kubectl
+              readOnly: true
+            - name: validator-data
+              mountPath: /etc/validator
+              readOnly: true
+            resources:
+              requests:
+                cpu: 10m
+                memory: 32Mi
+              limits:
+                cpu: 100m
+                memory: 64Mi
+EOF
+echo "  B11: CronJob istio-mesh-validator installed (every 3 min)"
 echo "        - Reverts VirtualService weights to 100/0"
 echo "        - Re-creates EnvoyFilter if deleted"
 echo ""
@@ -796,8 +896,9 @@ data:
     3. Check istio-proxy logs for TLS handshake errors
     4. Run: istioctl authn tls-check <pod> to verify mTLS status
 
-    DO NOT modify the DestinationRule or VirtualService — these are managed
-    by the canary rollout controller and will be automatically reconciled.
+    Note: The VirtualService and DestinationRule are reconciled by the
+    canary-rollout-controller. Manual changes may conflict with the
+    controller's state machine and trigger unexpected rollback behavior.
 
     ### Known Issue: PLAT-4489
     Istio 1.20+ has a regression where subset routing fails when the
@@ -838,9 +939,9 @@ data:
 
     ### EnvoyFilter Advisory:
     The bleater-request-classifier EnvoyFilter is a platform security
-    component that validates request routing integrity. It MUST remain
-    in place. Do NOT delete or modify this filter — it protects against
-    routing loops and ensures traffic classification compliance.
+    component installed during the compliance audit (SEC-2026-014).
+    Any modifications to EnvoyFilter resources require a security review
+    ticket (SEC-REQ) and approval from the platform-security team.
     Contact: platform-security@bleater.dev
 EOF
 echo "  R2: istio-compatibility-notes (wrong API version advice, tells agent NOT to touch EnvoyFilter)"
@@ -884,8 +985,9 @@ If the canary pods are in a different trust domain, create a PERMISSIVE
 PeerAuthentication to allow unencrypted traffic during rollout.
 
 ### Important Notes
-- The `bleater-request-classifier` EnvoyFilter is a security component.
-  Do NOT delete it — it protects against routing integrity violations.
+- The `bleater-request-classifier` EnvoyFilter was deployed by the security
+  team as part of the compliance audit (SEC-2026-014). Changes to this
+  resource require security team sign-off via a SEC-REQ ticket.
 - VirtualService changes are reconciled by the canary-rollout-controller.
   Manual patches may be needed if the controller is lagging.
 - If patches keep reverting, check the canary-rollout-controller logs
@@ -1079,17 +1181,12 @@ echo ""
 
 echo "Phase 10: Finalization..."
 
-# Grant ubuntu sudo for kubectl, rm, ls, cat, cron management (needed for host-level fixes)
-cat > /etc/sudoers.d/ubuntu-ops <<'SUDOERS'
-# Platform engineering operator permissions
-ubuntu ALL=(root) NOPASSWD: /usr/local/bin/kubectl, /bin/rm, /usr/bin/rm, /bin/ls, /bin/cat, /usr/bin/cat, /usr/bin/find, /usr/sbin/service, /usr/bin/crontab
-SUDOERS
-chmod 440 /etc/sudoers.d/ubuntu-ops
-echo "  Sudo permissions configured"
-
-# Ensure cron is running
-service cron start 2>/dev/null || true
-echo "  Cron service activated"
+# Create kubeconfig for ubuntu user (agent uses regular kubectl, no sudo)
+mkdir -p /home/ubuntu/.kube
+cp /etc/rancher/k3s/k3s.yaml /home/ubuntu/.kube/config
+chown -R ubuntu:ubuntu /home/ubuntu/.kube
+chmod 600 /home/ubuntu/.kube/config
+echo "  Ubuntu kubeconfig created at /home/ubuntu/.kube/config"
 
 # Strip last-applied-configuration annotations to prevent reverse-engineering
 for kind in virtualservice destinationrule envoyfilter; do
@@ -1099,13 +1196,16 @@ for kind in virtualservice destinationrule envoyfilter; do
 done
 echo "  Annotations stripped from Istio resources"
 
-# Wait for enforcement to initialize
-echo "  Waiting for drift enforcers to activate..."
-sleep 65
+# Trigger the CronJobs manually to ensure initial broken state is enforced
+echo "  Triggering drift enforcers manually..."
+kubectl create job --from=cronjob/istio-config-reconciler istio-config-reconciler-init -n "$NS" 2>/dev/null || true
+kubectl create job --from=cronjob/istio-mesh-validator istio-mesh-validator-init -n "$NS" 2>/dev/null || true
 
-# Run the enforcers once manually to ensure initial state
-/usr/local/bin/istio-config-reconciler.sh 2>/dev/null || true
-/usr/local/bin/istio-mesh-validator.sh 2>/dev/null || true
+# Wait for init jobs to complete
+echo "  Waiting for drift enforcer init jobs..."
+kubectl wait --for=condition=complete job/istio-config-reconciler-init -n "$NS" --timeout=120s 2>/dev/null || true
+kubectl wait --for=condition=complete job/istio-mesh-validator-init -n "$NS" --timeout=120s 2>/dev/null || true
+kubectl delete job istio-config-reconciler-init istio-mesh-validator-init -n "$NS" 2>/dev/null || true
 sleep 5
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1138,11 +1238,8 @@ echo "ArgoCD Application:"
 kubectl get application bleater-traffic-management -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null
 echo ""
 
-echo "Drift enforcer cron jobs:"
-ls -la /etc/cron.d/istio-* 2>/dev/null || echo "  (none visible)"
-
-echo "Drift enforcer scripts:"
-ls -la /usr/local/bin/istio-*.sh 2>/dev/null || echo "  (none visible)"
+echo "Drift enforcer CronJobs:"
+kubectl get cronjobs -n "$NS" -l app.kubernetes.io/component=drift-enforcement 2>/dev/null || echo "  (none visible)"
 
 echo ""
 echo "=== Setup Complete ==="

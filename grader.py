@@ -621,8 +621,8 @@ def check_f4_drift_resilience(app_label):
     Runs AFTER the 90s durability wait in cleanup_and_wait().
 
     4 checks:
-    1. No active drift enforcer cron jobs in /etc/cron.d/
-    2. No drift enforcer scripts in /usr/local/bin/
+    1. No active drift enforcer CronJobs in bleater namespace
+    2. No running/pending drift enforcer Jobs in bleater namespace
     3. VirtualService still has correct 90/10 weights (not reverted)
     4. Canary pods still have version: canary label + istio-proxy sidecar
     """
@@ -630,44 +630,61 @@ def check_f4_drift_resilience(app_label):
     checks_passed = 0
     total = 4
 
-    # Check 1: No drift enforcer cron jobs
-    cron_files_out, rc = run_cmd("ls /etc/cron.d/ 2>/dev/null")
-    suspicious_crons = []
-    if rc == 0 and cron_files_out:
-        for fname in cron_files_out.strip().split("\n"):
-            fname = fname.strip()
-            if not fname:
-                continue
-            if any(p in fname.lower() for p in [
-                "istio-config", "canary-config", "mesh-validator",
-                "config-enforcer", "istio-reconcil",
-            ]):
-                suspicious_crons.append(fname)
+    # Check 1: No drift enforcer CronJobs
+    cj_out, rc = run_kubectl(
+        "get", "cronjobs", "-o", "json", namespace=NS,
+    )
+    suspicious_cronjobs = []
+    if rc == 0 and cj_out:
+        try:
+            cjs = json.loads(cj_out)
+            for cj in cjs.get("items", []):
+                cj_name = cj.get("metadata", {}).get("name", "")
+                if any(p in cj_name.lower() for p in [
+                    "istio-config", "canary-config", "mesh-validator",
+                    "config-enforcer", "istio-reconcil",
+                ]):
+                    suspicious_cronjobs.append(cj_name)
+        except json.JSONDecodeError:
+            pass
 
-    if not suspicious_crons:
-        print(f"  [PASS] Check 1: No drift enforcer cron jobs found")
+    if not suspicious_cronjobs:
+        print(f"  [PASS] Check 1: No drift enforcer CronJobs found")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 1: Drift enforcer cron jobs found:")
-        for c in suspicious_crons:
-            print(f"    - /etc/cron.d/{c}")
+        print(f"  [FAIL] Check 1: Drift enforcer CronJobs found:")
+        for c in suspicious_cronjobs:
+            print(f"    - cronjob/{c}")
 
-    # Check 2: No drift enforcer scripts
-    enforcer_scripts = []
-    scripts_out, rc = run_cmd("ls /usr/local/bin/istio-*.sh 2>/dev/null")
-    if rc == 0 and scripts_out.strip():
-        for spath in scripts_out.strip().split("\n"):
-            spath = spath.strip()
-            if spath:
-                enforcer_scripts.append(spath)
+    # Check 2: No running/pending drift enforcer Jobs
+    jobs_out, rc = run_kubectl(
+        "get", "jobs", "-o", "json", namespace=NS,
+    )
+    suspicious_jobs = []
+    if rc == 0 and jobs_out:
+        try:
+            jobs = json.loads(jobs_out)
+            for job in jobs.get("items", []):
+                job_name = job.get("metadata", {}).get("name", "")
+                if any(p in job_name.lower() for p in [
+                    "istio-config", "canary-config", "mesh-validator",
+                    "config-enforcer", "istio-reconcil",
+                ]):
+                    # Check if job is still active
+                    status = job.get("status", {})
+                    active = status.get("active", 0)
+                    if active > 0:
+                        suspicious_jobs.append(f"{job_name} (active)")
+        except json.JSONDecodeError:
+            pass
 
-    if not enforcer_scripts:
-        print(f"  [PASS] Check 2: No drift enforcer scripts found")
+    if not suspicious_jobs:
+        print(f"  [PASS] Check 2: No active drift enforcer Jobs found")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 2: Drift enforcer scripts found:")
-        for s in enforcer_scripts:
-            print(f"    - {s}")
+        print(f"  [FAIL] Check 2: Active drift enforcer Jobs found:")
+        for j in suspicious_jobs:
+            print(f"    - job/{j}")
 
     # Check 3: VirtualService still correct after drift window
     vs_weights = _read_vs_weights(app_label)

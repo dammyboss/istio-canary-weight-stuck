@@ -2,30 +2,30 @@
 # Solution: Istio Canary Weight Stuck — Fix all 12 breakages
 set -e
 
-export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+export KUBECONFIG=/home/ubuntu/.kube/config
 NS="bleater"
 
 echo "=== Fixing Istio Canary Weight Stuck ==="
 echo ""
 
 # Discover the bleat-service deployment name
-BLEAT_DEPLOY=$(sudo kubectl get deployment -n "$NS" -o name 2>/dev/null | grep -E "bleat-service|bleater-bleat" | grep -v canary | head -1 | sed 's|deployment.apps/||')
+BLEAT_DEPLOY=$(kubectl get deployment -n "$NS" -o name 2>/dev/null | grep -E "bleat-service|bleater-bleat" | grep -v canary | head -1 | sed 's|deployment.apps/||')
 BLEAT_DEPLOY=${BLEAT_DEPLOY:-bleater-bleat-service}
-STABLE_APP_LABEL=$(sudo kubectl get deployment "$BLEAT_DEPLOY" -n "$NS" -o jsonpath='{.spec.template.metadata.labels.app}' 2>/dev/null)
+STABLE_APP_LABEL=$(kubectl get deployment "$BLEAT_DEPLOY" -n "$NS" -o jsonpath='{.spec.template.metadata.labels.app}' 2>/dev/null)
 STABLE_APP_LABEL=${STABLE_APP_LABEL:-bleat-service}
 echo "  Stable deployment: $BLEAT_DEPLOY"
 echo "  App label: $STABLE_APP_LABEL"
 
 # Discover actual K8s service name
-SVC_NAME=$(sudo kubectl get svc -n "$NS" -l app=${STABLE_APP_LABEL} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+SVC_NAME=$(kubectl get svc -n "$NS" -l app=${STABLE_APP_LABEL} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 if [ -z "$SVC_NAME" ]; then
-    SVC_NAME=$(sudo kubectl get svc -n "$NS" -o name 2>/dev/null | grep -E "bleat-service|bleater-bleat" | head -1 | sed 's|service/||')
+    SVC_NAME=$(kubectl get svc -n "$NS" -o name 2>/dev/null | grep -E "bleat-service|bleater-bleat" | head -1 | sed 's|service/||')
 fi
 SVC_NAME=${SVC_NAME:-bleater-bleat-service}
 echo "  K8s service name: $SVC_NAME"
 
 # Discover service port
-SVC_PORT=$(sudo kubectl get svc "$SVC_NAME" -n "$NS" -o jsonpath='{.spec.ports[0].port}' 2>/dev/null)
+SVC_PORT=$(kubectl get svc "$SVC_NAME" -n "$NS" -o jsonpath='{.spec.ports[0].port}' 2>/dev/null)
 SVC_PORT=${SVC_PORT:-8003}
 echo "  Service port: $SVC_PORT"
 echo ""
@@ -36,21 +36,23 @@ echo ""
 
 echo "Step 1: Removing drift enforcement..."
 
-# B10: Remove cron job istio-config-reconciler
-sudo rm -f /etc/cron.d/istio-config-reconciler
-sudo rm -f /usr/local/bin/istio-config-reconciler.sh
-echo "  Cron job istio-config-reconciler removed"
+# B10: Remove CronJob istio-config-reconciler
+kubectl delete cronjob istio-config-reconciler -n "$NS" 2>/dev/null && \
+    echo "  CronJob istio-config-reconciler deleted" || \
+    echo "  CronJob istio-config-reconciler not found"
 
-# B11: Remove cron job istio-mesh-validator
-sudo rm -f /etc/cron.d/istio-mesh-validator
-sudo rm -f /usr/local/bin/istio-mesh-validator.sh
-sudo rm -rf /var/lib/istio-mesh-validator
-echo "  Cron job istio-mesh-validator removed"
+# B11: Remove CronJob istio-mesh-validator
+kubectl delete cronjob istio-mesh-validator -n "$NS" 2>/dev/null && \
+    echo "  CronJob istio-mesh-validator deleted" || \
+    echo "  CronJob istio-mesh-validator not found"
 
-# Kill any running enforcer processes
-sudo pkill -f istio-config-reconciler.sh 2>/dev/null || true
-sudo pkill -f istio-mesh-validator.sh 2>/dev/null || true
-echo "  Drift enforcers neutralized"
+# Delete any running/completed jobs from the CronJobs
+kubectl delete jobs -n "$NS" -l app.kubernetes.io/component=drift-enforcement 2>/dev/null || true
+# Also delete by name pattern for jobs created by cronjobs
+for job in $(kubectl get jobs -n "$NS" -o name 2>/dev/null | grep -E "istio-config-reconciler|istio-mesh-validator"); do
+    kubectl delete "$job" -n "$NS" 2>/dev/null || true
+done
+echo "  Drift enforcer jobs cleaned up"
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -59,7 +61,7 @@ echo ""
 
 echo "Step 2: Removing EnvoyFilter fault injection..."
 
-sudo kubectl delete envoyfilter bleater-request-classifier -n "$NS" 2>/dev/null && \
+kubectl delete envoyfilter bleater-request-classifier -n "$NS" 2>/dev/null && \
     echo "  EnvoyFilter bleater-request-classifier deleted" || \
     echo "  EnvoyFilter not found (already removed)"
 echo ""
@@ -72,18 +74,18 @@ echo "Step 3: Fixing deployment labels..."
 
 # B6: Remove the poisoned track: canary label from stable deployment
 # AND add version: stable label
-sudo kubectl patch deployment "$BLEAT_DEPLOY" -n "$NS" --type=json \
+kubectl patch deployment "$BLEAT_DEPLOY" -n "$NS" --type=json \
     -p='[
         {"op":"remove","path":"/spec/template/metadata/labels/track"},
         {"op":"add","path":"/spec/template/metadata/labels/version","value":"stable"}
     ]' 2>/dev/null && echo "  Stable: removed track: canary, added version: stable" || \
-    sudo kubectl patch deployment "$BLEAT_DEPLOY" -n "$NS" --type=json \
+    kubectl patch deployment "$BLEAT_DEPLOY" -n "$NS" --type=json \
     -p='[
         {"op":"add","path":"/spec/template/metadata/labels/version","value":"stable"}
     ]' 2>/dev/null && echo "  Stable: added version: stable" || true
 
 # B4: Add version: canary label to canary deployment pod template
-sudo kubectl patch deployment "${BLEAT_DEPLOY}-canary" -n "$NS" --type=json \
+kubectl patch deployment "${BLEAT_DEPLOY}-canary" -n "$NS" --type=json \
     -p='[
         {"op":"add","path":"/spec/template/metadata/labels/version","value":"canary"}
     ]' 2>/dev/null && echo "  Canary: added version: canary" || true
@@ -97,7 +99,7 @@ echo ""
 echo "Step 4: Enabling Istio sidecar injection on canary..."
 
 # Remove the sidecar.istio.io/inject: false annotation
-sudo kubectl patch deployment "${BLEAT_DEPLOY}-canary" -n "$NS" --type=json \
+kubectl patch deployment "${BLEAT_DEPLOY}-canary" -n "$NS" --type=json \
     -p='[{"op":"remove","path":"/spec/template/metadata/annotations/sidecar.istio.io~1inject"}]' \
     2>/dev/null && echo "  Canary: sidecar injection enabled" || \
     echo "  Canary: annotation already removed"
@@ -110,7 +112,7 @@ echo ""
 
 echo "Step 5: Fixing DestinationRule subset selectors..."
 
-sudo kubectl apply -f - <<EOF
+kubectl apply -f - <<EOF
 apiVersion: networking.istio.io/v1beta1
 kind: DestinationRule
 metadata:
@@ -145,7 +147,7 @@ echo ""
 
 echo "Step 6: Fixing VirtualService weights and subset names..."
 
-sudo kubectl apply -f - <<EOF
+kubectl apply -f - <<EOF
 apiVersion: networking.istio.io/v1beta1
 kind: VirtualService
 metadata:
@@ -268,7 +270,7 @@ rm -rf "$TMPDIR"
 
 # Ensure ArgoCD repo credentials exist for Gitea access
 # ArgoCD pods use CoreDNS → ClusterIP (port 3000), not host ingress (port 80)
-sudo kubectl apply -f - <<REPOSECEOF
+kubectl apply -f - <<REPOSECEOF
 apiVersion: v1
 kind: Secret
 metadata:
@@ -285,7 +287,7 @@ REPOSECEOF
 echo "  ArgoCD repo credentials configured"
 
 # B7: Fix ArgoCD Application source path and ensure correct repoURL
-sudo kubectl patch application bleater-traffic-management -n argocd --type=json \
+kubectl patch application bleater-traffic-management -n argocd --type=json \
     -p='[
         {"op":"replace","path":"/spec/source/path","value":"deploy/istio"},
         {"op":"replace","path":"/spec/source/repoURL","value":"http://gitea.devops.local:3000/root/bleater-istio-config.git"}
@@ -293,7 +295,7 @@ sudo kubectl patch application bleater-traffic-management -n argocd --type=json 
     2>/dev/null && echo "  ArgoCD Application: path and repoURL fixed" || true
 
 # Trigger an ArgoCD sync
-sudo kubectl patch application bleater-traffic-management -n argocd --type=merge \
+kubectl patch application bleater-traffic-management -n argocd --type=merge \
     -p='{"operation":{"initiatedBy":{"username":"solution"},"sync":{"revision":"HEAD"}}}' \
     2>/dev/null || true
 echo "  ArgoCD sync triggered"
@@ -302,7 +304,7 @@ echo "  ArgoCD sync triggered"
 echo "  Waiting for ArgoCD sync..."
 ELAPSED=0
 while [ $ELAPSED -lt 120 ]; do
-    SYNC_STATUS=$(sudo kubectl get application bleater-traffic-management -n argocd \
+    SYNC_STATUS=$(kubectl get application bleater-traffic-management -n argocd \
         -o jsonpath='{.status.sync.status}' 2>/dev/null)
     if [ "$SYNC_STATUS" = "Synced" ]; then
         echo "  ArgoCD sync complete: $SYNC_STATUS"
@@ -321,18 +323,18 @@ echo ""
 echo "Step 8: Waiting for deployments to roll out..."
 
 # Wait for stable deployment rollout
-sudo kubectl rollout status deployment "$BLEAT_DEPLOY" -n "$NS" --timeout=300s 2>/dev/null || true
+kubectl rollout status deployment "$BLEAT_DEPLOY" -n "$NS" --timeout=300s 2>/dev/null || true
 echo "  Stable deployment rolled out"
 
 # Wait for canary deployment rollout (new pods need sidecar)
-sudo kubectl rollout status deployment "${BLEAT_DEPLOY}-canary" -n "$NS" --timeout=300s 2>/dev/null || true
+kubectl rollout status deployment "${BLEAT_DEPLOY}-canary" -n "$NS" --timeout=300s 2>/dev/null || true
 echo "  Canary deployment rolled out"
 
 # Wait for all pods to be ready (works with native sidecars too)
 echo "  Waiting for pods to be fully ready..."
-sudo kubectl wait --for=condition=ready pod -l app=${STABLE_APP_LABEL},version=canary \
+kubectl wait --for=condition=ready pod -l app=${STABLE_APP_LABEL},version=canary \
     -n "$NS" --timeout=300s 2>/dev/null && echo "  Canary pods ready" || echo "  Canary pod wait timed out"
-sudo kubectl wait --for=condition=ready pod -l app=${STABLE_APP_LABEL},version=stable \
+kubectl wait --for=condition=ready pod -l app=${STABLE_APP_LABEL},version=stable \
     -n "$NS" --timeout=300s 2>/dev/null && echo "  Stable pods ready" || echo "  Stable pod wait timed out"
 
 # Extra wait for Envoy sidecar to sync config from istiod
@@ -352,9 +354,9 @@ SVC_URL="${SVC_NAME}.${NS}.svc.cluster.local"
 # Find a non-bleat-service pod with sidecar for traffic generation
 EXEC_POD=""
 for LABEL in "app=api-gateway" "app=timeline-service" "app=authentication-service" "app=fanout-service"; do
-    POD=$(sudo kubectl get pods -n "$NS" -l ${LABEL} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    POD=$(kubectl get pods -n "$NS" -l ${LABEL} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
     if [ -n "$POD" ]; then
-        READY=$(sudo kubectl get pod "$POD" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+        READY=$(kubectl get pod "$POD" -n "$NS" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
         if [ "$READY" = "True" ]; then
             EXEC_POD="$POD"
             echo "  Using traffic source pod: $EXEC_POD"
@@ -365,13 +367,13 @@ done
 
 # Fallback to stable bleat-service pod if no other pod found
 if [ -z "$EXEC_POD" ]; then
-    EXEC_POD=$(sudo kubectl get pods -n "$NS" -l app=${STABLE_APP_LABEL},version=stable \
+    EXEC_POD=$(kubectl get pods -n "$NS" -l app=${STABLE_APP_LABEL},version=stable \
         -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
     echo "  Fallback traffic source: $EXEC_POD"
 fi
 
 if [ -n "$EXEC_POD" ]; then
-    sudo kubectl exec "$EXEC_POD" -n "$NS" -- sh -c "
+    kubectl exec "$EXEC_POD" -n "$NS" -- sh -c "
         for i in \$(seq 1 300); do
             wget -q -O /dev/null -T 2 http://${SVC_URL}:${SVC_PORT}/ 2>/dev/null || \
             curl -sf -o /dev/null -m 2 http://${SVC_URL}:${SVC_PORT}/ 2>/dev/null || true
@@ -391,36 +393,32 @@ echo ""
 echo "=== Verification ==="
 
 echo "VirtualService weights:"
-sudo kubectl get virtualservice bleat-service -n "$NS" -o jsonpath='{range .spec.http[0].route[*]}  {.destination.subset}: {.weight}{"\n"}{end}' 2>/dev/null
+kubectl get virtualservice bleat-service -n "$NS" -o jsonpath='{range .spec.http[0].route[*]}  {.destination.subset}: {.weight}{"\n"}{end}' 2>/dev/null
 
 echo ""
 echo "DestinationRule subsets:"
-sudo kubectl get destinationrule bleat-service -n "$NS" -o jsonpath='{range .spec.subsets[*]}  {.name}: {.labels}{"\n"}{end}' 2>/dev/null
+kubectl get destinationrule bleat-service -n "$NS" -o jsonpath='{range .spec.subsets[*]}  {.name}: {.labels}{"\n"}{end}' 2>/dev/null
 
 echo ""
 echo "EnvoyFilters in bleater:"
-sudo kubectl get envoyfilter -n "$NS" 2>/dev/null || echo "  None"
+kubectl get envoyfilter -n "$NS" 2>/dev/null || echo "  None"
 
 echo ""
 echo "Canary pods (should have istio-proxy):"
-sudo kubectl get pods -n "$NS" -l version=canary -o wide 2>/dev/null
+kubectl get pods -n "$NS" -l version=canary -o wide 2>/dev/null
 
 echo ""
 echo "Stable pods:"
-sudo kubectl get pods -n "$NS" -l version=stable -o wide 2>/dev/null
+kubectl get pods -n "$NS" -l version=stable -o wide 2>/dev/null
 
 echo ""
 echo "ArgoCD Application status:"
-sudo kubectl get application bleater-traffic-management -n argocd -o jsonpath='  sync: {.status.sync.status}, health: {.status.health.status}' 2>/dev/null
+kubectl get application bleater-traffic-management -n argocd -o jsonpath='  sync: {.status.sync.status}, health: {.status.health.status}' 2>/dev/null
 echo ""
 
 echo ""
-echo "Drift enforcer cron jobs (should be empty):"
-ls /etc/cron.d/istio-* 2>/dev/null || echo "  None"
-
-echo ""
-echo "Drift enforcer scripts (should be empty):"
-ls /usr/local/bin/istio-*.sh 2>/dev/null || echo "  None"
+echo "Drift enforcer CronJobs (should be empty):"
+kubectl get cronjobs -n "$NS" -l app.kubernetes.io/component=drift-enforcement 2>/dev/null || echo "  None"
 
 echo ""
 echo "=== Solution Complete ==="
