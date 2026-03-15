@@ -236,7 +236,7 @@ cd repo
 git config user.email "platform-team@bleater.dev"
 git config user.name "Platform Team"
 
-# B8: Fix VirtualService in repo (correct weights + subset names)
+# Fix deploy/istio/ manifests (for consistency)
 cat > deploy/istio/virtualservice.yaml <<VSEOF
 apiVersion: networking.istio.io/v1beta1
 kind: VirtualService
@@ -261,7 +261,6 @@ spec:
       weight: 10
 VSEOF
 
-# Fix DestinationRule in repo too
 cat > deploy/istio/destinationrule.yaml <<DREOF
 apiVersion: networking.istio.io/v1beta1
 kind: DestinationRule
@@ -289,30 +288,27 @@ spec:
       version: canary
 DREOF
 
-# Add kustomization.yaml to deploy/istio/ so ArgoCD can sync with Kustomize
-cat > deploy/istio/kustomization.yaml <<'KUSEOF'
+# Replace deploy/canary/ sabotaging resources with correct VS/DR
+# Keep the ArgoCD path as deploy/canary/ (no path change needed)
+rm -f deploy/canary/cronjob-reconciler.yaml deploy/canary/cronjob-validator.yaml \
+      deploy/canary/envoyfilter.yaml deploy/canary/deployment-config-agent.yaml \
+      deploy/canary/configmap-validator-data.yaml deploy/canary/serviceaccount.yaml \
+      deploy/canary/clusterrolebinding.yaml deploy/canary/postsync-validation.yaml \
+      deploy/canary/README.md 2>/dev/null || true
+
+# Put correct VS/DR directly in deploy/canary/ (ArgoCD syncs from here)
+cp deploy/istio/virtualservice.yaml deploy/canary/virtualservice.yaml
+cp deploy/istio/destinationrule.yaml deploy/canary/destinationrule.yaml
+
+# Update kustomization to reference only the correct manifests
+cat > deploy/canary/kustomization.yaml <<'KUSEOF'
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
 - virtualservice.yaml
 - destinationrule.yaml
 KUSEOF
-echo "  deploy/istio/kustomization.yaml created"
-
-# Clean deploy/canary/ — remove ArgoCD-managed sabotaging resources
-# This prevents ArgoCD from recreating drift enforcers when it syncs
-rm -f deploy/canary/cronjob-reconciler.yaml deploy/canary/cronjob-validator.yaml \
-      deploy/canary/envoyfilter.yaml deploy/canary/deployment-config-agent.yaml \
-      deploy/canary/configmap-validator-data.yaml deploy/canary/serviceaccount.yaml \
-      deploy/canary/clusterrolebinding.yaml deploy/canary/postsync-validation.yaml \
-      2>/dev/null || true
-# Update kustomization to empty resources
-cat > deploy/canary/kustomization.yaml <<'KUSEOF'
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-resources: []
-KUSEOF
-echo "  deploy/canary/ cleaned: sabotaging resources removed"
+echo "  deploy/canary/ fixed: sabotaging resources replaced with correct VS/DR"
 
 git add -A
 git commit -m "fix: correct canary VirtualService weights and subset names
@@ -348,16 +344,11 @@ stringData:
 REPOSECEOF
 echo "  ArgoCD repo credentials configured"
 
-# B7: Fix ArgoCD Application source path, repoURL, and re-enable auto-sync
-# Path changes from deploy/canary/ (sabotaging resources) to deploy/istio/ (correct manifests)
-# Re-enable automated sync with selfHeal + prune (prune will clean up old deploy/canary/ resources)
+# Re-enable ArgoCD automated sync with selfHeal + prune
+# Keep path as deploy/canary/ (we replaced sabotaging resources with correct VS/DR there)
 kubectl patch application bleater-traffic-management -n argocd --type=merge \
     -p='{
         "spec": {
-            "source": {
-                "path": "deploy/istio",
-                "repoURL": "http://gitea.devops.local:3000/root/bleater-istio-config.git"
-            },
             "syncPolicy": {
                 "automated": {
                     "selfHeal": true,
@@ -366,7 +357,7 @@ kubectl patch application bleater-traffic-management -n argocd --type=merge \
             }
         }
     }' \
-    2>/dev/null && echo "  ArgoCD Application: path fixed, auto-sync re-enabled" || true
+    2>/dev/null && echo "  ArgoCD auto-sync re-enabled with prune" || true
 
 # Trigger an ArgoCD sync
 kubectl patch application bleater-traffic-management -n argocd --type=merge \
