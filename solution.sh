@@ -489,5 +489,19 @@ echo ""
 echo "Platform config agent Deployment (should be gone):"
 kubectl get deployment platform-config-agent -n "$NS" 2>/dev/null || echo "  None (deleted)"
 
+# Final cleanup: force-delete any lingering PostSync hook Jobs
+# ArgoCD may recreate these from stale cache during intermediate syncs
+kubectl delete job istio-postsync-validation -n "$NS" --force --grace-period=0 2>/dev/null || true
+kubectl delete jobs -n "$NS" -l app.kubernetes.io/component=drift-enforcement --force --grace-period=0 2>/dev/null || true
+# Also delete any jobs with ArgoCD hook annotations
+for job in $(kubectl get jobs -n "$NS" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null); do
+    HOOK=$(kubectl get job "$job" -n "$NS" -o jsonpath='{.metadata.annotations.argocd\.argoproj\.io/hook}' 2>/dev/null)
+    if [ -n "$HOOK" ]; then
+        kubectl delete job "$job" -n "$NS" --force --grace-period=0 2>/dev/null || true
+    fi
+done
+echo ""
+echo "PostSync hook Jobs cleaned up"
+
 echo ""
 echo "=== Solution Complete ==="
