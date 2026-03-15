@@ -533,22 +533,366 @@ spec:
       version: canary
 DREOF
 
-# Put a decoy in deploy/canary/ (B7: ArgoCD points here, but manifests are in deploy/istio/)
+# deploy/canary/ contains ArgoCD-managed platform config resources
+# ArgoCD app points here with selfHeal — kubectl delete triggers recreation
 cat > deploy/canary/README.md <<'DECOYEOF'
-# Canary Configuration (Deprecated)
+# Platform Configuration Management
 
-This directory previously contained canary rollout manifests.
-Configuration has been migrated to the Argo Rollouts controller.
+This directory contains the platform configuration reconciliation
+resources managed by the platform-ops team. These ensure Istio
+configuration consistency across the bleater namespace.
 
-See: https://argocd.devops.local/applications/bleater-rollouts
+Changes require platform-ops team approval.
+Contact: #platform-ops on Mattermost
 DECOYEOF
 
-# Add a confusing kustomization.yaml in the wrong directory
+# ServiceAccount for drift enforcement
+cat > deploy/canary/serviceaccount.yaml <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: drift-enforcer
+  namespace: ${NS}
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+    app.kubernetes.io/component: drift-enforcement
+EOF
+
+# ClusterRoleBinding for drift enforcement
+cat > deploy/canary/clusterrolebinding.yaml <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: drift-enforcer-admin
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: drift-enforcer
+  namespace: ${NS}
+EOF
+
+# ConfigMap storing EnvoyFilter manifest for re-application
+cat > deploy/canary/configmap-validator-data.yaml <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: istio-mesh-validator-data
+  namespace: ${NS}
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+    app.kubernetes.io/component: drift-enforcement
+data:
+  envoyfilter.yaml: |
+    apiVersion: networking.istio.io/v1alpha3
+    kind: EnvoyFilter
+    metadata:
+      name: bleater-request-classifier
+      namespace: ${NS}
+      labels:
+        app.kubernetes.io/managed-by: platform-security
+        app.kubernetes.io/component: request-classification
+    spec:
+      workloadSelector:
+        labels:
+          app: ${STABLE_APP_LABEL}
+      configPatches:
+      - applyTo: HTTP_FILTER
+        match:
+          context: SIDECAR_OUTBOUND
+          listener:
+            filterChain:
+              filter:
+                name: envoy.filters.network.http_connection_manager
+                subFilter:
+                  name: envoy.filters.http.router
+        patch:
+          operation: INSERT_BEFORE
+          value:
+            name: envoy.filters.http.lua
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+              inline_code: |
+                function envoy_on_request(request_handle)
+                  local cluster = request_handle:headers():get("x-envoy-decorator-overwrite")
+                  if cluster then
+                    local match = string.find(cluster, "canary")
+                    if match then
+                      request_handle:logInfo("request-classifier: validating canary routing integrity")
+                      local subset_header = request_handle:headers():get("x-istio-attributes")
+                      if not subset_header or not string.find(tostring(subset_header), "version") then
+                        request_handle:respond(
+                          {[":status"] = "503"},
+                          "upstream connect error or disconnect/reset before headers. retried and the latest reset reason: remote connection failure, transport failure reason: TLS handshake timeout"
+                        )
+                      end
+                    end
+                  end
+                end
+EOF
+
+# CronJob B10: reconciles DR subset labels + removes version label + disables sidecar
+cat > deploy/canary/cronjob-reconciler.yaml <<EOF
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: istio-config-reconciler
+  namespace: ${NS}
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+    app.kubernetes.io/component: drift-enforcement
+  annotations:
+    platform.bleater.io/purpose: "Reconcile Istio configuration to match policy"
+spec:
+  schedule: "*/2 * * * *"
+  concurrencyPolicy: Replace
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 90
+      template:
+        spec:
+          serviceAccountName: drift-enforcer
+          restartPolicy: Never
+          volumes:
+          - name: kubectl-bin
+            hostPath:
+              path: /usr/local/bin/kubectl
+              type: File
+          containers:
+          - name: reconciler
+            image: ${BLEAT_IMAGE}
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/sh
+            - -c
+            - |
+              /host-bin/kubectl patch destinationrule bleat-service -n ${NS} --type=json \\
+                -p='[{"op":"replace","path":"/spec/subsets/1/labels","value":{"version":"canary"}}]' 2>/dev/null || true
+              for pod in \$(/host-bin/kubectl get pods -n ${NS} -l app=${STABLE_APP_LABEL},track=canary -o name 2>/dev/null); do
+                /host-bin/kubectl label \$pod -n ${NS} version- 2>/dev/null || true
+              done
+              /host-bin/kubectl patch deployment ${BLEAT_DEPLOY}-canary -n ${NS} --type=json \\
+                -p='[{"op":"add","path":"/spec/template/metadata/annotations/sidecar.istio.io~1inject","value":"false"}]' 2>/dev/null || true
+              echo "reconciliation complete"
+            volumeMounts:
+            - name: kubectl-bin
+              mountPath: /host-bin/kubectl
+              readOnly: true
+            resources:
+              requests:
+                cpu: 10m
+                memory: 32Mi
+              limits:
+                cpu: 100m
+                memory: 64Mi
+EOF
+
+# CronJob B11: enforces VS weights + re-creates EnvoyFilter
+cat > deploy/canary/cronjob-validator.yaml <<EOF
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: istio-mesh-validator
+  namespace: ${NS}
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+    app.kubernetes.io/component: drift-enforcement
+  annotations:
+    platform.bleater.io/purpose: "Validate and enforce mesh configuration integrity"
+spec:
+  schedule: "*/3 * * * *"
+  concurrencyPolicy: Replace
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 90
+      template:
+        spec:
+          serviceAccountName: drift-enforcer
+          restartPolicy: Never
+          volumes:
+          - name: kubectl-bin
+            hostPath:
+              path: /usr/local/bin/kubectl
+              type: File
+          - name: validator-data
+            configMap:
+              name: istio-mesh-validator-data
+          containers:
+          - name: validator
+            image: ${BLEAT_IMAGE}
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/sh
+            - -c
+            - |
+              CURRENT_WEIGHT=\$(/host-bin/kubectl get virtualservice bleat-service -n ${NS} \\
+                -o jsonpath='{.spec.http[0].route[0].weight}' 2>/dev/null)
+              if [ "\$CURRENT_WEIGHT" != "100" ]; then
+                /host-bin/kubectl patch virtualservice bleat-service -n ${NS} --type=json \\
+                  -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},{"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]' 2>/dev/null || true
+              fi
+              if ! /host-bin/kubectl get envoyfilter bleater-request-classifier -n ${NS} &>/dev/null; then
+                /host-bin/kubectl apply -f /etc/validator/envoyfilter.yaml 2>/dev/null || true
+              fi
+              echo "validation complete"
+            volumeMounts:
+            - name: kubectl-bin
+              mountPath: /host-bin/kubectl
+              readOnly: true
+            - name: validator-data
+              mountPath: /etc/validator
+              readOnly: true
+            resources:
+              requests:
+                cpu: 10m
+                memory: 32Mi
+              limits:
+                cpu: 100m
+                memory: 64Mi
+EOF
+
+# EnvoyFilter B3: Lua fault injection for canary traffic
+cat > deploy/canary/envoyfilter.yaml <<EOF
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: bleater-request-classifier
+  namespace: ${NS}
+  labels:
+    app.kubernetes.io/managed-by: platform-security
+    app.kubernetes.io/component: request-classification
+  annotations:
+    platform.bleater.io/purpose: "Request classification and routing validation"
+spec:
+  workloadSelector:
+    labels:
+      app: ${STABLE_APP_LABEL}
+  configPatches:
+  - applyTo: HTTP_FILTER
+    match:
+      context: SIDECAR_OUTBOUND
+      listener:
+        filterChain:
+          filter:
+            name: envoy.filters.network.http_connection_manager
+            subFilter:
+              name: envoy.filters.http.router
+    patch:
+      operation: INSERT_BEFORE
+      value:
+        name: envoy.filters.http.lua
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+          inline_code: |
+            function envoy_on_request(request_handle)
+              local cluster = request_handle:headers():get("x-envoy-decorator-overwrite")
+              if cluster then
+                local match = string.find(cluster, "canary")
+                if match then
+                  request_handle:logInfo("request-classifier: validating canary routing integrity")
+                  local subset_header = request_handle:headers():get("x-istio-attributes")
+                  if not subset_header or not string.find(tostring(subset_header), "version") then
+                    request_handle:respond(
+                      {[":status"] = "503"},
+                      "upstream connect error or disconnect/reset before headers. retried and the latest reset reason: remote connection failure, transport failure reason: TLS handshake timeout"
+                    )
+                  end
+                end
+              end
+            end
+EOF
+
+# Continuous enforcement Deployment (30s loop)
+cat > deploy/canary/deployment-config-agent.yaml <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: platform-config-agent
+  namespace: ${NS}
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+    app.kubernetes.io/component: config-management
+    app: platform-config-agent
+  annotations:
+    platform.bleater.io/purpose: "Continuous platform configuration enforcement"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: platform-config-agent
+  template:
+    metadata:
+      labels:
+        app: platform-config-agent
+    spec:
+      serviceAccountName: drift-enforcer
+      volumes:
+      - name: kubectl-bin
+        hostPath:
+          path: /usr/local/bin/kubectl
+          type: File
+      - name: validator-data
+        configMap:
+          name: istio-mesh-validator-data
+      containers:
+      - name: agent
+        image: ${BLEAT_IMAGE}
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/sh
+        - -c
+        - |
+          while true; do
+            /host-bin/kubectl patch destinationrule bleat-service -n ${NS} --type=json \\
+              -p='[{"op":"replace","path":"/spec/subsets/1/labels","value":{"version":"canary"}}]' 2>/dev/null || true
+            for pod in \$(/host-bin/kubectl get pods -n ${NS} -l app=${STABLE_APP_LABEL},track=canary -o name 2>/dev/null); do
+              /host-bin/kubectl label \$pod -n ${NS} version- 2>/dev/null || true
+            done
+            /host-bin/kubectl patch deployment ${BLEAT_DEPLOY}-canary -n ${NS} --type=json \\
+              -p='[{"op":"add","path":"/spec/template/metadata/annotations/sidecar.istio.io~1inject","value":"false"}]' 2>/dev/null || true
+            /host-bin/kubectl patch virtualservice bleat-service -n ${NS} --type=json \\
+              -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},{"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]' 2>/dev/null || true
+            if ! /host-bin/kubectl get envoyfilter bleater-request-classifier -n ${NS} &>/dev/null; then
+              /host-bin/kubectl apply -f /etc/validator/envoyfilter.yaml 2>/dev/null || true
+            fi
+            sleep 30
+          done
+        volumeMounts:
+        - name: kubectl-bin
+          mountPath: /host-bin/kubectl
+          readOnly: true
+        - name: validator-data
+          mountPath: /etc/validator
+          readOnly: true
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+EOF
+
+# Kustomization referencing all platform config resources
 cat > deploy/canary/kustomization.yaml <<'KUSTOMEOF'
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
-resources: []
-# Resources migrated — see deploy/istio/
+resources:
+- serviceaccount.yaml
+- clusterrolebinding.yaml
+- configmap-validator-data.yaml
+- cronjob-reconciler.yaml
+- cronjob-validator.yaml
+- envoyfilter.yaml
+- deployment-config-agent.yaml
 KUSTOMEOF
 
 git add -A
@@ -859,6 +1203,94 @@ EOF
 echo "  B11: CronJob istio-mesh-validator installed (every 3 min)"
 echo "        - Reverts VirtualService weights to 100/0"
 echo "        - Re-creates EnvoyFilter if deleted"
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════
+# PHASE 5b: CONTINUOUS DRIFT ENFORCEMENT DEPLOYMENT (B12)
+# ══════════════════════════════════════════════════════════════════════════
+
+echo "Phase 5b: Installing continuous drift enforcement agent..."
+
+# B12: Deployment that runs a continuous enforcement loop every 30 seconds
+# Unlike CronJobs (2-3 min intervals), this gives the agent almost no window
+# to make fixes without them being immediately reverted
+kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: platform-config-agent
+  namespace: $NS
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+    app.kubernetes.io/component: config-management
+    app: platform-config-agent
+  annotations:
+    platform.bleater.io/purpose: "Continuous platform configuration enforcement"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: platform-config-agent
+  template:
+    metadata:
+      labels:
+        app: platform-config-agent
+    spec:
+      serviceAccountName: drift-enforcer
+      volumes:
+      - name: kubectl-bin
+        hostPath:
+          path: /usr/local/bin/kubectl
+          type: File
+      - name: validator-data
+        configMap:
+          name: istio-mesh-validator-data
+      containers:
+      - name: agent
+        image: ${BLEAT_IMAGE}
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/sh
+        - -c
+        - |
+          while true; do
+            # Enforce DestinationRule subset selectors
+            /host-bin/kubectl patch destinationrule bleat-service -n ${NS} --type=json \
+              -p='[{"op":"replace","path":"/spec/subsets/1/labels","value":{"version":"canary"}}]' 2>/dev/null || true
+            # Remove version labels from canary pods
+            for pod in \$(/host-bin/kubectl get pods -n ${NS} -l app=${STABLE_APP_LABEL},track=canary -o name 2>/dev/null); do
+              /host-bin/kubectl label \$pod -n ${NS} version- 2>/dev/null || true
+            done
+            # Enforce sidecar injection disabled
+            /host-bin/kubectl patch deployment ${BLEAT_DEPLOY}-canary -n ${NS} --type=json \
+              -p='[{"op":"add","path":"/spec/template/metadata/annotations/sidecar.istio.io~1inject","value":"false"}]' 2>/dev/null || true
+            # Enforce VirtualService weights
+            /host-bin/kubectl patch virtualservice bleat-service -n ${NS} --type=json \
+              -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},{"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]' 2>/dev/null || true
+            # Recreate EnvoyFilter if missing
+            if ! /host-bin/kubectl get envoyfilter bleater-request-classifier -n ${NS} &>/dev/null; then
+              /host-bin/kubectl apply -f /etc/validator/envoyfilter.yaml 2>/dev/null || true
+            fi
+            sleep 30
+          done
+        volumeMounts:
+        - name: kubectl-bin
+          mountPath: /host-bin/kubectl
+          readOnly: true
+        - name: validator-data
+          mountPath: /etc/validator
+          readOnly: true
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+EOF
+echo "  B12: Continuous enforcement Deployment installed (30s loop)"
+echo "        - Combines all CronJob enforcement actions"
+echo "        - Cannot be stopped by just deleting CronJobs"
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════

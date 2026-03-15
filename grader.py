@@ -630,11 +630,13 @@ def check_f4_drift_resilience(app_label):
     checks_passed = 0
     total = 4
 
-    # Check 1: No drift enforcer CronJobs
+    # Check 1: No drift enforcer CronJobs or Deployments
+    suspicious_resources = []
+
+    # Check CronJobs
     cj_out, rc = run_kubectl(
         "get", "cronjobs", "-o", "json", namespace=NS,
     )
-    suspicious_cronjobs = []
     if rc == 0 and cj_out:
         try:
             cjs = json.loads(cj_out)
@@ -644,17 +646,35 @@ def check_f4_drift_resilience(app_label):
                     "istio-config", "canary-config", "mesh-validator",
                     "config-enforcer", "istio-reconcil",
                 ]):
-                    suspicious_cronjobs.append(cj_name)
+                    suspicious_resources.append(f"cronjob/{cj_name}")
         except json.JSONDecodeError:
             pass
 
-    if not suspicious_cronjobs:
-        print(f"  [PASS] Check 1: No drift enforcer CronJobs found")
+    # Check Deployments for continuous enforcement agents
+    dep_out, rc = run_kubectl(
+        "get", "deployments", "-o", "json", namespace=NS,
+    )
+    if rc == 0 and dep_out:
+        try:
+            deps = json.loads(dep_out)
+            for dep in deps.get("items", []):
+                dep_name = dep.get("metadata", {}).get("name", "")
+                dep_labels = dep.get("metadata", {}).get("labels", {})
+                if any(p in dep_name.lower() for p in [
+                    "platform-config-agent", "config-enforcer",
+                    "drift-enforc", "config-management",
+                ]) or dep_labels.get("app.kubernetes.io/component") == "config-management":
+                    suspicious_resources.append(f"deployment/{dep_name}")
+        except json.JSONDecodeError:
+            pass
+
+    if not suspicious_resources:
+        print(f"  [PASS] Check 1: No drift enforcer CronJobs or Deployments found")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 1: Drift enforcer CronJobs found:")
-        for c in suspicious_cronjobs:
-            print(f"    - cronjob/{c}")
+        print(f"  [FAIL] Check 1: Drift enforcer resources still present:")
+        for r in suspicious_resources:
+            print(f"    - {r}")
 
     # Check 2: No running/pending drift enforcer Jobs
     jobs_out, rc = run_kubectl(

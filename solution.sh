@@ -31,10 +31,29 @@ echo "  Service port: $SVC_PORT"
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════
-# STEP 1: NEUTRALIZE DRIFT ENFORCERS (MUST be first!)
+# STEP 0: DISABLE ARGOCD AUTO-SYNC (prevents selfHeal from recreating resources)
+# ══════════════════════════════════════════════════════════════════════════
+
+echo "Step 0: Disabling ArgoCD automated sync..."
+
+# The sabotaging resources (CronJobs, EnvoyFilter, Deployment) are ArgoCD-managed
+# via deploy/canary/ with selfHeal: true. Must disable auto-sync before deleting them.
+kubectl patch application bleater-traffic-management -n argocd --type=json \
+    -p='[{"op":"remove","path":"/spec/syncPolicy/automated"}]' \
+    2>/dev/null && echo "  ArgoCD automated sync disabled" || \
+    echo "  ArgoCD sync policy already manual"
+echo ""
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 1: NEUTRALIZE ALL DRIFT ENFORCERS (MUST be first!)
 # ══════════════════════════════════════════════════════════════════════════
 
 echo "Step 1: Removing drift enforcement..."
+
+# B12: Remove continuous enforcement Deployment
+kubectl delete deployment platform-config-agent -n "$NS" 2>/dev/null && \
+    echo "  Deployment platform-config-agent deleted" || \
+    echo "  Deployment platform-config-agent not found"
 
 # B10: Remove CronJob istio-config-reconciler
 kubectl delete cronjob istio-config-reconciler -n "$NS" 2>/dev/null && \
@@ -262,17 +281,32 @@ spec:
       version: canary
 DREOF
 
+# Clean deploy/canary/ — remove ArgoCD-managed sabotaging resources
+# This prevents ArgoCD from recreating drift enforcers when it syncs
+rm -f deploy/canary/cronjob-reconciler.yaml deploy/canary/cronjob-validator.yaml \
+      deploy/canary/envoyfilter.yaml deploy/canary/deployment-config-agent.yaml \
+      deploy/canary/configmap-validator-data.yaml deploy/canary/serviceaccount.yaml \
+      deploy/canary/clusterrolebinding.yaml 2>/dev/null || true
+# Update kustomization to empty resources
+cat > deploy/canary/kustomization.yaml <<'KUSEOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources: []
+KUSEOF
+echo "  deploy/canary/ cleaned: sabotaging resources removed"
+
 git add -A
 git commit -m "fix: correct canary VirtualService weights and subset names
 
 - Set traffic split to 90/10 (stable/canary)
 - Fix subset name from canary-v2 to canary
 - Align DestinationRule subset selectors with pod labels
+- Remove drift enforcement resources from deploy/canary/
 
 Fixes: PLAT-4521" 2>/dev/null
 
 git push origin main 2>/dev/null
-echo "  Gitea repo fixed: VirtualService 90/10, correct subsets"
+echo "  Gitea repo fixed: VirtualService 90/10, correct subsets, drift enforcers removed"
 
 cd /
 rm -rf "$TMPDIR"
@@ -295,19 +329,31 @@ stringData:
 REPOSECEOF
 echo "  ArgoCD repo credentials configured"
 
-# B7: Fix ArgoCD Application source path and ensure correct repoURL
-kubectl patch application bleater-traffic-management -n argocd --type=json \
-    -p='[
-        {"op":"replace","path":"/spec/source/path","value":"deploy/istio"},
-        {"op":"replace","path":"/spec/source/repoURL","value":"http://gitea.devops.local:3000/root/bleater-istio-config.git"}
-    ]' \
-    2>/dev/null && echo "  ArgoCD Application: path and repoURL fixed" || true
+# B7: Fix ArgoCD Application source path, repoURL, and re-enable auto-sync
+# Path changes from deploy/canary/ (sabotaging resources) to deploy/istio/ (correct manifests)
+# Re-enable automated sync with selfHeal + prune (prune will clean up old deploy/canary/ resources)
+kubectl patch application bleater-traffic-management -n argocd --type=merge \
+    -p='{
+        "spec": {
+            "source": {
+                "path": "deploy/istio",
+                "repoURL": "http://gitea.devops.local:3000/root/bleater-istio-config.git"
+            },
+            "syncPolicy": {
+                "automated": {
+                    "selfHeal": true,
+                    "prune": true
+                }
+            }
+        }
+    }' \
+    2>/dev/null && echo "  ArgoCD Application: path fixed, auto-sync re-enabled" || true
 
 # Trigger an ArgoCD sync
 kubectl patch application bleater-traffic-management -n argocd --type=merge \
-    -p='{"operation":{"initiatedBy":{"username":"solution"},"sync":{"revision":"HEAD"}}}' \
+    -p='{"operation":{"initiatedBy":{"username":"solution"},"sync":{"revision":"HEAD","prune":true}}}' \
     2>/dev/null || true
-echo "  ArgoCD sync triggered"
+echo "  ArgoCD sync triggered (with prune)"
 
 # Wait for ArgoCD to sync
 echo "  Waiting for ArgoCD sync..."
@@ -428,6 +474,10 @@ echo ""
 echo ""
 echo "Drift enforcer CronJobs (should be empty):"
 kubectl get cronjobs -n "$NS" -l app.kubernetes.io/component=drift-enforcement 2>/dev/null || echo "  None"
+
+echo ""
+echo "Platform config agent Deployment (should be gone):"
+kubectl get deployment platform-config-agent -n "$NS" 2>/dev/null || echo "  None (deleted)"
 
 echo ""
 echo "=== Solution Complete ==="
