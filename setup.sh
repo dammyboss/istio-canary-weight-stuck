@@ -96,7 +96,9 @@ for i in $(seq 1 5); do
 done
 
 # Enable Istio telemetry metrics (ensures istio_requests_total is exported to Prometheus)
-kubectl_retry apply -f - <<TELEOF
+# Use temp file for retry (heredoc stdin is consumed on first attempt)
+TELFILE=$(mktemp)
+cat > "$TELFILE" <<TELEOF
 apiVersion: telemetry.istio.io/v1
 kind: Telemetry
 metadata:
@@ -107,6 +109,8 @@ spec:
   - providers:
     - name: prometheus
 TELEOF
+kubectl_retry apply -f "$TELFILE"
+rm -f "$TELFILE"
 echo "  Istio telemetry metrics enabled"
 
 # Wait for ArgoCD
@@ -210,7 +214,7 @@ kubectl patch deployment "$BLEAT_DEPLOY" -n "$NS" --type=json \
 echo "  B6: Stable deployment poisoned with track: canary label"
 
 # B4 + B5: Create canary deployment with wrong labels + sidecar disabled
-kubectl_retry apply -f - <<EOF
+kubectl apply -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -281,7 +285,7 @@ kubectl label namespace "$NS" istio-injection=enabled --overwrite 2>/dev/null ||
 # B1: DestinationRule with wrong subset selectors
 # canary subset uses version: canary (pods have track: canary, not version: canary)
 # stable subset uses version: stable (stable pods don't have this either)
-kubectl_retry apply -f - <<EOF
+kubectl apply -f - <<EOF
 apiVersion: networking.istio.io/v1beta1
 kind: DestinationRule
 metadata:
@@ -313,7 +317,7 @@ EOF
 echo "  B1: DestinationRule with mismatched subset selectors (version vs track)"
 
 # B2: VirtualService with wrong subset name (canary-v2 instead of canary)
-kubectl_retry apply -f - <<EOF
+kubectl apply -f - <<EOF
 apiVersion: networking.istio.io/v1beta1
 kind: VirtualService
 metadata:
@@ -344,7 +348,7 @@ echo "  B2: VirtualService routes to subset canary-v2 (doesn't exist in DR)"
 # B3: EnvoyFilter with Lua fault injection for canary traffic
 # This is the hidden killer — NOT visible via kubectl get vs/dr
 # It intercepts traffic at the Envoy level and returns 503 for canary-bound requests
-kubectl_retry apply -f - <<EOF
+kubectl apply -f - <<EOF
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
@@ -967,7 +971,7 @@ rm -rf "$TMPDIR"
 
 # Create ArgoCD repo credentials for Gitea access
 # Note: ArgoCD runs as a pod, so uses CoreDNS → ClusterIP (port 3000), not host ingress (port 80)
-kubectl_retry apply -f - <<EOF
+kubectl apply -f - <<EOF
 apiVersion: v1
 kind: Secret
 metadata:
@@ -984,7 +988,7 @@ EOF
 echo "  ArgoCD repo credentials configured"
 
 # B7 + B9: Create ArgoCD Application with wrong source path + selfHeal
-kubectl_retry apply -f - <<EOF
+kubectl apply -f - <<EOF
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -1031,7 +1035,7 @@ echo ""
 echo "Phase 5: Installing drift enforcement agents..."
 
 # Create ServiceAccount + RBAC for drift enforcer CronJobs
-kubectl_retry apply -f - <<EOF
+kubectl apply -f - <<EOF
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -1059,7 +1063,7 @@ EOF
 echo "  Drift enforcer ServiceAccount + RBAC created"
 
 # Store the EnvoyFilter manifest in a ConfigMap for re-application by B11
-kubectl_retry apply -f - <<EOF
+kubectl apply -f - <<EOF
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -1124,7 +1128,7 @@ echo "  EnvoyFilter manifest stored in ConfigMap"
 # - Patches DestinationRule canary subset selector back to version: canary
 # - Removes version: canary label from canary pods
 # - Re-adds sidecar.istio.io/inject: false to canary deployment
-kubectl_retry apply -f - <<EOF
+kubectl apply -f - <<EOF
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -1189,7 +1193,7 @@ echo "        - Removes version label from canary pods"
 echo "        - Re-adds sidecar inject: false to canary deployment"
 
 # B11: CronJob that enforces VirtualService weights + re-applies EnvoyFilter every 3 minutes
-kubectl_retry apply -f - <<EOF
+kubectl apply -f - <<EOF
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -1269,7 +1273,7 @@ echo "Phase 5b: Installing continuous drift enforcement agent..."
 # B12: Deployment that runs a continuous enforcement loop every 30 seconds
 # Unlike CronJobs (2-3 min intervals), this gives the agent almost no window
 # to make fixes without them being immediately reverted
-kubectl_retry apply -f - <<EOF
+kubectl apply -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -1355,7 +1359,7 @@ echo ""
 echo "Phase 6: Creating red herring resources..."
 
 # R1: ConfigMap with wrong advice (mTLS is the problem)
-kubectl_retry apply -f - <<EOF
+kubectl apply -f - <<EOF
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -1402,7 +1406,7 @@ EOF
 echo "  R1: canary-deployment-runbook (wrong mTLS advice)"
 
 # R2: ConfigMap suggesting API version issue
-kubectl_retry apply -f - <<EOF
+kubectl apply -f - <<EOF
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -1631,7 +1635,7 @@ echo ""
 echo "Phase 9: Creating decoy resources..."
 
 # Decoy HPA that looks like it could scale canary to 0
-kubectl_retry apply -f - <<EOF
+kubectl apply -f - <<EOF
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
