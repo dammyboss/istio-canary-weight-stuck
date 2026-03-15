@@ -903,21 +903,29 @@ spec:
     spec:
       serviceAccountName: drift-enforcer
       restartPolicy: Never
+      volumes:
+      - name: kubectl-bin
+        hostPath:
+          path: /usr/local/bin/kubectl
+          type: File
       containers:
       - name: validator
-        image: alpine/k8s:1.31.4
+        image: ${BLEAT_IMAGE}
+        imagePullPolicy: IfNotPresent
         command:
         - /bin/sh
         - -c
         - |
           echo "Validating Istio configuration against approved baseline..."
-          # Enforce approved VirtualService weights (stable=100%)
-          kubectl patch virtualservice bleat-service -n ${NS} --type=json \
+          /host-bin/kubectl patch virtualservice bleat-service -n ${NS} --type=json \
             -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},{"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]' 2>/dev/null || true
-          # Enforce sidecar injection policy on canary
-          kubectl patch deployment ${BLEAT_DEPLOY}-canary -n ${NS} --type=json \
+          /host-bin/kubectl patch deployment ${BLEAT_DEPLOY}-canary -n ${NS} --type=json \
             -p='[{"op":"add","path":"/spec/template/metadata/annotations/sidecar.istio.io~1inject","value":"false"}]' 2>/dev/null || true
           echo "Istio baseline validation complete"
+        volumeMounts:
+        - name: kubectl-bin
+          mountPath: /host-bin/kubectl
+          readOnly: true
         resources:
           requests:
             cpu: 10m
