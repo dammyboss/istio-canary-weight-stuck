@@ -415,10 +415,10 @@ def check_f1_canary_traffic_routing(app_label, svc_name):
             pass
 
     if canary_with_sidecar >= 1:
-        print(f"  [PASS] Check 1: {canary_with_sidecar} canary pod(s) with sidecar and Ready")
+        print(f"  ✅ Check 1: {canary_with_sidecar} canary pod(s) with sidecar and Ready")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 1: canary pods with sidecar={canary_with_sidecar}, "
+        print(f"  ❌ Check 1: canary pods with sidecar={canary_with_sidecar}, "
               f"ready without sidecar={canary_pods_ready}")
 
     # Generate traffic so Prometheus has data to query
@@ -440,19 +440,19 @@ def check_f1_canary_traffic_routing(app_label, svc_name):
 
     # Check 2: Canary request rate > 0
     if canary_rate > 0:
-        print(f"  [PASS] Check 2: Canary request rate = {canary_rate:.4f} req/s")
+        print(f"  ✅ Check 2: Canary request rate = {canary_rate:.4f} req/s")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 2: Canary request rate = 0 (no traffic reaching canary)")
+        print(f"  ❌ Check 2: Canary request rate = 0 (no traffic reaching canary)")
 
     # Check 3: VirtualService has correct 90/10 weights with correct subset names
     # Verifies the agent configured the routing correctly (config-level check)
     vs_weights = _read_vs_weights(app_label)
     if vs_weights and vs_weights.get("stable") == 90 and vs_weights.get("canary") == 10:
-        print(f"  [PASS] Check 3: VirtualService weights = stable:90, canary:10")
+        print(f"  ✅ Check 3: VirtualService weights = stable:90, canary:10")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 3: VirtualService weights = {vs_weights} "
+        print(f"  ❌ Check 3: VirtualService weights = {vs_weights} "
               f"(expected stable:90, canary:10)")
 
     # Check 4: No significant 503 errors for canary (EnvoyFilter removed)
@@ -470,15 +470,15 @@ def check_f1_canary_traffic_routing(app_label, svc_name):
     error_threshold = max(canary_rate * 0.05, 0.01) if canary_rate > 0 else 0.01
     if error_rate <= error_threshold:
         if error_rate > 0:
-            print(f"  [PASS] Check 4: Canary 503 rate = {error_rate:.4f} (residual, below threshold)")
+            print(f"  ✅ Check 4: Canary 503 rate = {error_rate:.4f} (residual, below threshold)")
         else:
-            print(f"  [PASS] Check 4: No 503 errors for canary in Prometheus")
+            print(f"  ✅ Check 4: No 503 errors for canary in Prometheus")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 4: Canary 503 error rate = {error_rate:.4f} req/s (threshold: {error_threshold:.4f})")
+        print(f"  ❌ Check 4: Canary 503 error rate = {error_rate:.4f} req/s (threshold: {error_threshold:.4f})")
 
     score = 1.0 if checks_passed == total else 0.0
-    print(f"{'PASSED' if score == 1.0 else 'FAILED'} F1 ({checks_passed}/{total})")
+    print(f"{'✅ PASSED' if score == 1.0 else '❌ FAILED'} F1 ({checks_passed}/{total})")
     return score
 
 
@@ -523,22 +523,22 @@ def check_f2_gitops_convergence(app_label):
             # Pass if: app exists, has automated sync, and is not in Error state
             if sync_status in ("Synced", "OutOfSync") and has_auto_sync:
                 argocd_ok = True
-                print(f"  [PASS] Check 1: ArgoCD app exists, auto-sync enabled, "
+                print(f"  ✅ Check 1: ArgoCD app exists, auto-sync enabled, "
                       f"status={sync_status}, path={source_path}")
                 checks_passed += 1
             else:
-                print(f"  [FAIL] Check 1: ArgoCD app status={sync_status}, "
+                print(f"  ❌ Check 1: ArgoCD app status={sync_status}, "
                       f"auto-sync={'enabled' if has_auto_sync else 'disabled'}")
         except json.JSONDecodeError:
-            print(f"  [FAIL] Check 1: Could not parse ArgoCD app JSON")
+            print(f"  ❌ Check 1: Could not parse ArgoCD app JSON")
     else:
-        print(f"  [FAIL] Check 1: ArgoCD app not found or unreachable")
+        print(f"  ❌ Check 1: ArgoCD app not found or unreachable")
 
     # Check 2: Git repo has correct manifests and no saboteur references
     git_state = _verify_git_repo_state()
     git_ok = git_state["vs_correct"] and git_state["no_saboteurs"] and git_state["dr_correct"]
     if git_ok:
-        print(f"  [PASS] Check 2: Git repo has correct VS/DR and no saboteur references")
+        print(f"  ✅ Check 2: Git repo has correct VS/DR and no saboteur references")
         checks_passed += 1
     else:
         details = []
@@ -548,17 +548,17 @@ def check_f2_gitops_convergence(app_label):
             details.append("saboteur files still referenced in kustomization")
         if not git_state["dr_correct"]:
             details.append("DR subsets incorrect in Git")
-        print(f"  [FAIL] Check 2: Git repo issues: {'; '.join(details)}")
+        print(f"  ❌ Check 2: Git repo issues: {'; '.join(details)}")
 
     # Check 3: VirtualService weights correct
     vs_correct = False
     vs_weights = _read_vs_weights(app_label)
     if vs_weights and vs_weights.get("stable") == 90 and vs_weights.get("canary") == 10:
         vs_correct = True
-        print(f"  [PASS] Check 3: VirtualService weights = stable:90, canary:10")
+        print(f"  ✅ Check 3: VirtualService weights = stable:90, canary:10")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 3: VirtualService weights = {vs_weights} "
+        print(f"  ❌ Check 3: VirtualService weights = {vs_weights} "
               f"(expected stable:90, canary:10)")
 
     # Check 4: VirtualService stability — wait 120s and re-read
@@ -567,15 +567,15 @@ def check_f2_gitops_convergence(app_label):
         time.sleep(120)
         vs_weights2 = _read_vs_weights(app_label)
         if vs_weights2 and vs_weights2.get("stable") == 90 and vs_weights2.get("canary") == 10:
-            print(f"  [PASS] Check 4: VirtualService stable after 120s (no drift)")
+            print(f"  ✅ Check 4: VirtualService stable after 120s (no drift)")
             checks_passed += 1
         else:
-            print(f"  [FAIL] Check 4: VirtualService drifted to {vs_weights2} after 120s")
+            print(f"  ❌ Check 4: VirtualService drifted to {vs_weights2} after 120s")
     else:
-        print(f"  [FAIL] Check 4: Skipped (Check 3 failed)")
+        print(f"  ❌ Check 4: Skipped (Check 3 failed)")
 
     score = 1.0 if checks_passed == total else 0.0
-    print(f"{'PASSED' if score == 1.0 else 'FAILED'} F2 ({checks_passed}/{total})")
+    print(f"{'✅ PASSED' if score == 1.0 else '❌ FAILED'} F2 ({checks_passed}/{total})")
     return score
 
 
@@ -619,10 +619,10 @@ def check_f3_service_mesh_integrity(app_label):
             pass
 
     if canary_count >= 1 and sidecar_count == canary_count:
-        print(f"  [PASS] Check 1: All {canary_count} canary pods have istio-proxy sidecar")
+        print(f"  ✅ Check 1: All {canary_count} canary pods have istio-proxy sidecar")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 1: {sidecar_count}/{canary_count} canary pods have istio-proxy")
+        print(f"  ❌ Check 1: {sidecar_count}/{canary_count} canary pods have istio-proxy")
 
     # Check 2: No EnvoyFilter with fault injection
     ef_out, rc = run_kubectl(
@@ -641,7 +641,7 @@ def check_f3_service_mesh_integrity(app_label):
                         ":respond(", "503", ":abort", "envoy.filters.http.lua"
                     ]):
                         has_fault_injection = True
-                        print(f"  [FAIL] Check 2: EnvoyFilter '{ef_name}' contains fault injection")
+                        print(f"  ❌ Check 2: EnvoyFilter '{ef_name}' contains fault injection")
                         break
                 if has_fault_injection:
                     break
@@ -649,7 +649,7 @@ def check_f3_service_mesh_integrity(app_label):
             pass
 
     if not has_fault_injection:
-        print(f"  [PASS] Check 2: No EnvoyFilter with fault injection found")
+        print(f"  ✅ Check 2: No EnvoyFilter with fault injection found")
         checks_passed += 1
 
     # Check 3: DestinationRule canary subset has matching pods
@@ -665,12 +665,12 @@ def check_f3_service_mesh_integrity(app_label):
         )
         matching_pods = len(pods_out.split()) if pods_out.strip() else 0
         if matching_pods >= 1:
-            print(f"  [PASS] Check 3: Canary subset ({canary_selector}) matches {matching_pods} pod(s)")
+            print(f"  ✅ Check 3: Canary subset ({canary_selector}) matches {matching_pods} pod(s)")
             checks_passed += 1
         else:
-            print(f"  [FAIL] Check 3: Canary subset ({canary_selector}) matches 0 pods")
+            print(f"  ❌ Check 3: Canary subset ({canary_selector}) matches 0 pods")
     else:
-        print(f"  [FAIL] Check 3: Could not find canary subset in DestinationRule")
+        print(f"  ❌ Check 3: Could not find canary subset in DestinationRule")
 
     # Check 4: Stable subset has matching pods that are NOT canary pods (B6 trap)
     if stable_selector:
@@ -696,19 +696,19 @@ def check_f3_service_mesh_integrity(app_label):
                 pass
 
         if matching_pods >= 1 and canary_in_stable == 0:
-            print(f"  [PASS] Check 4: Stable subset ({stable_selector}) matches "
+            print(f"  ✅ Check 4: Stable subset ({stable_selector}) matches "
                   f"{matching_pods} pod(s), none are canary")
             checks_passed += 1
         elif matching_pods >= 1 and canary_in_stable > 0:
-            print(f"  [FAIL] Check 4: Stable subset matches {matching_pods} pods but "
+            print(f"  ❌ Check 4: Stable subset matches {matching_pods} pods but "
                   f"{canary_in_stable} are canary pods (label trap not fixed)")
         else:
-            print(f"  [FAIL] Check 4: Stable subset ({stable_selector}) matches 0 pods")
+            print(f"  ❌ Check 4: Stable subset ({stable_selector}) matches 0 pods")
     else:
-        print(f"  [FAIL] Check 4: Could not find stable subset in DestinationRule")
+        print(f"  ❌ Check 4: Could not find stable subset in DestinationRule")
 
     score = 1.0 if checks_passed == total else 0.0
-    print(f"{'PASSED' if score == 1.0 else 'FAILED'} F3 ({checks_passed}/{total})")
+    print(f"{'✅ PASSED' if score == 1.0 else '❌ FAILED'} F3 ({checks_passed}/{total})")
     return score
 
 
@@ -772,10 +772,10 @@ def check_f4_drift_resilience(app_label):
             pass
 
     if not suspicious_resources:
-        print(f"  [PASS] Check 1: No drift enforcer CronJobs or Deployments found")
+        print(f"  ✅ Check 1: No drift enforcer CronJobs or Deployments found")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 1: Drift enforcer resources still present:")
+        print(f"  ❌ Check 1: Drift enforcer resources still present:")
         for r in suspicious_resources:
             print(f"    - {r}")
 
@@ -814,20 +814,20 @@ def check_f4_drift_resilience(app_label):
             pass
 
     if not suspicious_jobs:
-        print(f"  [PASS] Check 2: No drift enforcer Jobs or PostSync hooks found")
+        print(f"  ✅ Check 2: No drift enforcer Jobs or PostSync hooks found")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 2: Drift enforcer Jobs found:")
+        print(f"  ❌ Check 2: Drift enforcer Jobs found:")
         for j in suspicious_jobs:
             print(f"    - job/{j}")
 
     # Check 3: VirtualService still correct after drift window
     vs_weights = _read_vs_weights(app_label)
     if vs_weights and vs_weights.get("stable") == 90 and vs_weights.get("canary") == 10:
-        print(f"  [PASS] Check 3: VirtualService weights still 90/10 after drift window")
+        print(f"  ✅ Check 3: VirtualService weights still 90/10 after drift window")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 3: VirtualService weights = {vs_weights}")
+        print(f"  ❌ Check 3: VirtualService weights = {vs_weights}")
 
     # Check 4: Canary pods still have version label + sidecar
     pods_out, rc = run_kubectl(
@@ -845,13 +845,13 @@ def check_f4_drift_resilience(app_label):
             pass
 
     if labeled_with_sidecar >= 1:
-        print(f"  [PASS] Check 4: {labeled_with_sidecar} canary pod(s) with version label + sidecar intact")
+        print(f"  ✅ Check 4: {labeled_with_sidecar} canary pod(s) with version label + sidecar intact")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 4: No canary pods with version: canary label and istio-proxy sidecar")
+        print(f"  ❌ Check 4: No canary pods with version: canary label and istio-proxy sidecar")
 
     score = 1.0 if checks_passed == total else 0.0
-    print(f"{'PASSED' if score == 1.0 else 'FAILED'} F4 ({checks_passed}/{total})")
+    print(f"{'✅ PASSED' if score == 1.0 else '❌ FAILED'} F4 ({checks_passed}/{total})")
     return score
 
 
@@ -897,10 +897,10 @@ def check_f5_canary_golden_signals(app_label, svc_name):
 
     # Check 1: Canary request rate > 0 in Prometheus
     if canary_rate > 0:
-        print(f"  [PASS] Check 1: Canary request rate = {canary_rate:.4f} req/s")
+        print(f"  ✅ Check 1: Canary request rate = {canary_rate:.4f} req/s")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 1: Canary request rate = 0")
+        print(f"  ❌ Check 1: Canary request rate = 0")
 
     # Check 2: Canary HTTP 200 response rate > 0 (successful responses, not just traffic)
     # This is distinct from F1 — verifies the canary serves SUCCESSFUL responses,
@@ -916,14 +916,14 @@ def check_f5_canary_golden_signals(app_label, svc_name):
             break
 
     if canary_200_rate > 0:
-        print(f"  [PASS] Check 2: Canary 200 response rate = {canary_200_rate:.4f} req/s")
+        print(f"  ✅ Check 2: Canary 200 response rate = {canary_200_rate:.4f} req/s")
         checks_passed += 1
     else:
         # If canary rate > 0 but no 200s, all canary traffic is errors
         if canary_rate > 0:
-            print(f"  [FAIL] Check 2: Canary receives traffic ({canary_rate:.4f}) but no 200 responses")
+            print(f"  ❌ Check 2: Canary receives traffic ({canary_rate:.4f}) but no 200 responses")
         else:
-            print(f"  [FAIL] Check 2: Canary 200 response rate = 0")
+            print(f"  ❌ Check 2: Canary 200 response rate = 0")
 
     # Check 3: Jaeger has traces for the service
     jaeger_urls = [
@@ -958,24 +958,24 @@ def check_f5_canary_golden_signals(app_label, svc_name):
             break
 
     if canary_traces_found:
-        print(f"  [PASS] Check 3: Jaeger traces found with canary endpoint")
+        print(f"  ✅ Check 3: Jaeger traces found with canary endpoint")
         checks_passed += 1
     elif any_traces_found:
         if canary_rate > 0:
             # Jaeger may not tag version explicitly. If Prometheus confirms canary traffic
             # and Jaeger has traces for the service, the observability stack is working
-            print(f"  [PASS] Check 3: Jaeger has traces and Prometheus confirms canary traffic")
+            print(f"  ✅ Check 3: Jaeger has traces and Prometheus confirms canary traffic")
             checks_passed += 1
         else:
-            print(f"  [FAIL] Check 3: Jaeger has traces but no canary traffic confirmed")
+            print(f"  ❌ Check 3: Jaeger has traces but no canary traffic confirmed")
     else:
         if canary_rate > 0:
             # Jaeger unavailable but Prometheus confirms canary — partial credit
-            print(f"  [PASS] Check 3: Prometheus confirms canary traffic "
+            print(f"  ✅ Check 3: Prometheus confirms canary traffic "
                   f"(rate={canary_rate:.4f}), Jaeger unavailable")
             checks_passed += 1
         else:
-            print(f"  [FAIL] Check 3: No traces and no canary traffic confirmed")
+            print(f"  ❌ Check 3: No traces and no canary traffic confirmed")
 
     # Check 4: destination_version label propagation in Prometheus
     # Verifies that the Istio telemetry pipeline propagates pod labels into
@@ -1004,18 +1004,18 @@ def check_f5_canary_golden_signals(app_label, svc_name):
             break
 
     if version_labels_exist and stable_labels_exist:
-        print(f"  [PASS] Check 4: Both destination_version=canary and =stable labels in Prometheus")
+        print(f"  ✅ Check 4: Both destination_version=canary and =stable labels in Prometheus")
         checks_passed += 1
     elif version_labels_exist:
         # Canary labels exist but stable doesn't — partial, still pass (stable may take time)
-        print(f"  [PASS] Check 4: destination_version=canary labels present in Prometheus")
+        print(f"  ✅ Check 4: destination_version=canary labels present in Prometheus")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 4: destination_version labels not found in Prometheus "
+        print(f"  ❌ Check 4: destination_version labels not found in Prometheus "
               f"(canary={version_labels_exist}, stable={stable_labels_exist})")
 
     score = 1.0 if checks_passed == total else 0.0
-    print(f"{'PASSED' if score == 1.0 else 'FAILED'} F5 ({checks_passed}/{total})")
+    print(f"{'✅ PASSED' if score == 1.0 else '❌ FAILED'} F5 ({checks_passed}/{total})")
     return score
 
 
@@ -1098,8 +1098,8 @@ def grade(transcript: str) -> GradingResult:
     feedback_lines = []
     for key, (code, desc) in labels.items():
         s = subscores.get(key, 0)
-        icon = "PASS" if s >= 1.0 else "FAIL"
-        feedback_lines.append(f"[{icon}] {code}: {desc}")
+        icon = "✅" if s >= 1.0 else "❌"
+        feedback_lines.append(f"{icon} {code}: {desc}")
 
     print(f"\n=== Final Score: {round(total_score, 3)} ===")
     for line in feedback_lines:
