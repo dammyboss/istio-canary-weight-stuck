@@ -282,6 +282,16 @@ spec:
       version: canary
 DREOF
 
+# Add kustomization.yaml to deploy/istio/ so ArgoCD can sync with Kustomize
+cat > deploy/istio/kustomization.yaml <<'KUSEOF'
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+- virtualservice.yaml
+- destinationrule.yaml
+KUSEOF
+echo "  deploy/istio/kustomization.yaml created"
+
 # Clean deploy/canary/ — remove ArgoCD-managed sabotaging resources
 # This prevents ArgoCD from recreating drift enforcers when it syncs
 rm -f deploy/canary/cronjob-reconciler.yaml deploy/canary/cronjob-validator.yaml \
