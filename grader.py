@@ -439,9 +439,9 @@ def check_f1_canary_traffic_routing(app_label, svc_name):
               f"ready without sidecar={canary_pods_ready}")
 
     # Generate traffic so Prometheus has data to query
-    generate_mesh_traffic(app_label, svc_name, num_requests=300)
-    print("  Waiting 30s for Prometheus scrape cycle...")
-    time.sleep(30)
+    generate_mesh_traffic(app_label, svc_name, num_requests=150)
+    print("  Waiting 15s for Prometheus scrape cycle...")
+    time.sleep(15)
 
     # Try multiple Prometheus query patterns for canary rate
     canary_rate = 0.0
@@ -902,9 +902,9 @@ def check_f5_canary_golden_signals(app_label, svc_name):
     total = 4
 
     # Generate more traffic for fresh metrics
-    generate_mesh_traffic(app_label, svc_name, num_requests=200)
-    print("  Waiting 30s for Prometheus scrape cycle...")
-    time.sleep(30)
+    generate_mesh_traffic(app_label, svc_name, num_requests=150)
+    print("  Waiting 15s for Prometheus scrape cycle...")
+    time.sleep(15)
 
     # Try multiple query patterns for canary
     canary_rate = 0.0

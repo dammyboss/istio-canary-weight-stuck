@@ -11,9 +11,9 @@ prompt: |
   [Task]
   The platform engineering team recently attempted a manual canary rollout for bleat-service by
   deploying a new bleat-service-canary Deployment alongside the stable version and configuring
-  Istio traffic management to route 10% of traffic to the canary. However, after the rollout
-  was applied, 100% of traffic continues to reach the stable version — the canary is receiving
-  zero requests.
+  Istio traffic management to route a small percentage of traffic to the canary as defined in
+  the team's original rollout plan. However, after the rollout was applied, 100% of traffic
+  continues to reach the stable version — the canary is receiving zero requests.
 
   Observed symptoms:
   - Canary pods show Ready status but receive no traffic according to Prometheus metrics
@@ -26,11 +26,11 @@ prompt: |
 
   Your task is to investigate why canary traffic weight is stuck at 0%, identify ALL root
   causes across the routing configuration, deployment layer, and any automated processes
-  that may be interfering, and restore correct traffic splitting so that approximately 10%
-  of traffic reaches the canary and 90% reaches stable.
+  that may be interfering, and restore the correct traffic splitting as originally planned
+  by the team (check Mattermost discussions and Gitea wiki for the intended configuration).
 
   Ensure:
-  - Traffic is correctly split (~10% canary / ~90% stable) and verifiable via Prometheus metrics
+  - Traffic is correctly split according to the team's rollout plan and verifiable via Prometheus metrics
   - The Istio service mesh is properly configured for both stable and canary subsets
   - All fixes are permanent and managed declaratively — no manual patches that will drift
   - The canary rollout state is stable and could be progressively shifted to 25%, 50%, 100%
