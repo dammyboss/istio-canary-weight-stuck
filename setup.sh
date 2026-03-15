@@ -1013,7 +1013,9 @@ spec:
     automated:
       # B9: selfHeal reverts any manual kubectl changes
       selfHeal: true
-      prune: true
+      # prune: false means removing resources from kustomization.yaml
+      # does NOT auto-delete them from the cluster — agent must manually delete
+      prune: false
     syncOptions:
     - CreateNamespace=false
     - ApplyOutOfSyncOnly=true

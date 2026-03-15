@@ -265,6 +265,29 @@ def _verify_git_repo_state():
                             if sab in content:
                                 has_saboteur_refs = True
                                 print(f"  Git repo still references saboteur: {sab}")
+        # Also check that saboteur files don't physically exist with active content
+        sabotage_patterns = [
+            "weight: 100", "weight: 0",
+            "kubectl patch", "envoy.filters.http.lua",
+            "istio-config-reconciler", "mesh-validator",
+            "platform-config-agent", "config-enforcer",
+            "postsync-validation",
+        ]
+        for root_d, dirs_d, files_d in os.walk(repo_dir):
+            if ".git" in root_d:
+                continue
+            for f in files_d:
+                if f in saboteur_files:
+                    fpath = os.path.join(root_d, f)
+                    try:
+                        with open(fpath, "r") as fh:
+                            content = fh.read()
+                            if any(pat in content for pat in sabotage_patterns):
+                                has_saboteur_refs = True
+                                print(f"  Git repo contains saboteur file: {f}")
+                    except Exception:
+                        pass
+
         results["no_saboteurs"] = not has_saboteur_refs
 
         # Check for VirtualService with correct weights in any YAML
