@@ -346,8 +346,10 @@ def cleanup_and_wait():
     print("Waiting 90 seconds for drift enforcement window...")
     time.sleep(90)
 
-    # Force ArgoCD to re-sync from Git — catches agents who only did kubectl fixes
-    # without updating the Git repo. ArgoCD selfHeal will re-apply Git state.
+    # Force ArgoCD to hard-refresh repo cache and let auto-sync re-apply Git state.
+    # This catches agents who only did kubectl fixes without updating Git.
+    # We do NOT manually trigger sync — that would race the repo cache refresh
+    # and use stale manifests (including PostSync hooks the agent already removed).
     print("Forcing ArgoCD hard refresh to verify declarative state...")
     run_kubectl(
         "patch", "application", "bleater-traffic-management",
@@ -355,16 +357,8 @@ def cleanup_and_wait():
         '-p={"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}',
         namespace="argocd",
     )
-    time.sleep(5)
-    # Trigger sync with prune to force Git state onto cluster
-    run_kubectl(
-        "patch", "application", "bleater-traffic-management",
-        "--type=merge",
-        '-p={"operation":{"initiatedBy":{"username":"grader"},"sync":{"revision":"HEAD","prune":true}}}',
-        namespace="argocd",
-    )
-    print("Waiting 120 seconds for ArgoCD sync + prune...")
-    time.sleep(120)
+    print("Waiting 180 seconds for ArgoCD auto-sync from fresh repo cache...")
+    time.sleep(180)
     print("=== Durability window complete ===\n")
 
 
