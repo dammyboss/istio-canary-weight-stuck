@@ -65,11 +65,12 @@ kubectl delete cronjob istio-mesh-validator -n "$NS" 2>/dev/null && \
     echo "  CronJob istio-mesh-validator deleted" || \
     echo "  CronJob istio-mesh-validator not found"
 
-# Delete any running/completed jobs from the CronJobs
-kubectl delete jobs -n "$NS" -l app.kubernetes.io/component=drift-enforcement 2>/dev/null || true
-# Also delete by name pattern for jobs created by cronjobs
-for job in $(kubectl get jobs -n "$NS" -o name 2>/dev/null | grep -E "istio-config-reconciler|istio-mesh-validator"); do
-    kubectl delete "$job" -n "$NS" 2>/dev/null || true
+# Delete any running/completed jobs (including PostSync hooks)
+kubectl delete jobs -n "$NS" -l app.kubernetes.io/component=drift-enforcement --wait=false 2>/dev/null || true
+# Also delete PostSync hook job and CronJob jobs by name
+kubectl delete job istio-postsync-validation -n "$NS" --wait=false 2>/dev/null || true
+for job in $(kubectl get jobs -n "$NS" -o name 2>/dev/null | grep -E "istio-config-reconciler|istio-mesh-validator|postsync"); do
+    kubectl delete "$job" -n "$NS" --wait=false 2>/dev/null || true
 done
 echo "  Drift enforcer jobs cleaned up"
 echo ""
