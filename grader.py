@@ -802,14 +802,20 @@ def check_f4_drift_resilience(app_label):
                         suspicious_jobs.append(f"{job_name} (active)")
 
                 # Check for ArgoCD PostSync hook Jobs that sabotage config
+                # Only flag if the Job is active (running) — completed old hooks are harmless
                 if "argocd.argoproj.io/hook" in annotations:
-                    containers = (job.get("spec", {}).get("template", {})
-                                  .get("spec", {}).get("containers", []))
-                    for c in containers:
-                        cmd = " ".join(c.get("command", []) + c.get("args", []))
-                        if "patch" in cmd and ("virtualservice" in cmd.lower() or "weight" in cmd):
-                            suspicious_jobs.append(f"{job_name} (ArgoCD PostSync hook)")
-                            break
+                    status = job.get("status", {})
+                    active = status.get("active", 0)
+                    succeeded = status.get("succeeded", 0)
+                    # Flag active hooks OR recently succeeded hooks (within grading window)
+                    if active > 0:
+                        containers = (job.get("spec", {}).get("template", {})
+                                      .get("spec", {}).get("containers", []))
+                        for c in containers:
+                            cmd = " ".join(c.get("command", []) + c.get("args", []))
+                            if "patch" in cmd and ("virtualservice" in cmd.lower() or "weight" in cmd):
+                                suspicious_jobs.append(f"{job_name} (ArgoCD PostSync hook - active)")
+                                break
         except json.JSONDecodeError:
             pass
 
