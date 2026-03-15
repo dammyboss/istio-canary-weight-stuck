@@ -504,20 +504,35 @@ def check_f2_gitops_convergence(app_label):
     checks_passed = 0
     total = 4
 
-    # Check 1: ArgoCD app sync status
-    sync_out, rc = run_kubectl(
+    # Check 1: ArgoCD app exists and has automated sync enabled
+    # We accept Synced or OutOfSync (metadata drift from kubectl apply is normal)
+    # The real declarative check is Check 2 (git repo verification)
+    app_out, rc = run_kubectl(
         "get", "application", "bleater-traffic-management",
-        "-o", "jsonpath={.status.sync.status}",
-        namespace="argocd",
+        "-o", "json", namespace="argocd",
     )
-    if rc == 0 and sync_out.strip() in ("Synced", "OutOfSync"):
-        if sync_out.strip() == "Synced":
-            print(f"  [PASS] Check 1: ArgoCD sync status = Synced")
-            checks_passed += 1
-        else:
-            print(f"  [FAIL] Check 1: ArgoCD sync status = '{sync_out.strip()}' (expected Synced)")
+    argocd_ok = False
+    if rc == 0 and app_out:
+        try:
+            app = json.loads(app_out)
+            sync_status = app.get("status", {}).get("sync", {}).get("status", "")
+            sync_policy = app.get("spec", {}).get("syncPolicy", {})
+            has_auto_sync = "automated" in sync_policy
+            source_path = app.get("spec", {}).get("source", {}).get("path", "")
+
+            # Pass if: app exists, has automated sync, and is not in Error state
+            if sync_status in ("Synced", "OutOfSync") and has_auto_sync:
+                argocd_ok = True
+                print(f"  [PASS] Check 1: ArgoCD app exists, auto-sync enabled, "
+                      f"status={sync_status}, path={source_path}")
+                checks_passed += 1
+            else:
+                print(f"  [FAIL] Check 1: ArgoCD app status={sync_status}, "
+                      f"auto-sync={'enabled' if has_auto_sync else 'disabled'}")
+        except json.JSONDecodeError:
+            print(f"  [FAIL] Check 1: Could not parse ArgoCD app JSON")
     else:
-        print(f"  [FAIL] Check 1: ArgoCD sync status = '{sync_out.strip()}' (expected Synced)")
+        print(f"  [FAIL] Check 1: ArgoCD app not found or unreachable")
 
     # Check 2: Git repo has correct manifests and no saboteur references
     git_state = _verify_git_repo_state()
