@@ -73,6 +73,13 @@ for job in $(kubectl get jobs -n "$NS" -o name 2>/dev/null | grep -E "istio-conf
     kubectl delete "$job" -n "$NS" --wait=false 2>/dev/null || true
 done
 echo "  Drift enforcer jobs cleaned up"
+
+# Clean up remaining drift enforcer infrastructure (SA, RBAC, ConfigMap)
+# These are leftovers from deploy/canary/ that ArgoCD needs pruned for Synced status
+kubectl delete serviceaccount drift-enforcer -n "$NS" 2>/dev/null || true
+kubectl delete clusterrolebinding drift-enforcer-admin 2>/dev/null || true
+kubectl delete configmap istio-mesh-validator-data -n "$NS" 2>/dev/null || true
+echo "  Drift enforcer infrastructure cleaned up"
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════
