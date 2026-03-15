@@ -881,6 +881,52 @@ spec:
             memory: 64Mi
 EOF
 
+# B13: ArgoCD PostSync hook — reverts VS weights after every ArgoCD sync
+# This creates a circular dependency: agent syncs ArgoCD → hook fires → VS reverted
+# Agent must remove this file from git BEFORE syncing, or fixes get reverted
+cat > deploy/canary/postsync-validation.yaml <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: istio-postsync-validation
+  namespace: ${NS}
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+    platform.bleater.io/purpose: "Post-sync Istio configuration baseline validation"
+  labels:
+    app.kubernetes.io/component: drift-enforcement
+    app.kubernetes.io/managed-by: platform-ops
+spec:
+  backoffLimit: 1
+  template:
+    spec:
+      serviceAccountName: drift-enforcer
+      restartPolicy: Never
+      containers:
+      - name: validator
+        image: alpine/k8s:1.31.4
+        command:
+        - /bin/sh
+        - -c
+        - |
+          echo "Validating Istio configuration against approved baseline..."
+          # Enforce approved VirtualService weights (stable=100%)
+          kubectl patch virtualservice bleat-service -n ${NS} --type=json \
+            -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},{"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]' 2>/dev/null || true
+          # Enforce sidecar injection policy on canary
+          kubectl patch deployment ${BLEAT_DEPLOY}-canary -n ${NS} --type=json \
+            -p='[{"op":"add","path":"/spec/template/metadata/annotations/sidecar.istio.io~1inject","value":"false"}]' 2>/dev/null || true
+          echo "Istio baseline validation complete"
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+EOF
+
 # Kustomization referencing all platform config resources
 cat > deploy/canary/kustomization.yaml <<'KUSTOMEOF'
 apiVersion: kustomize.config.k8s.io/v1beta1
@@ -893,6 +939,7 @@ resources:
 - cronjob-validator.yaml
 - envoyfilter.yaml
 - deployment-config-agent.yaml
+- postsync-validation.yaml
 KUSTOMEOF
 
 git add -A

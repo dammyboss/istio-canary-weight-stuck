@@ -286,7 +286,8 @@ DREOF
 rm -f deploy/canary/cronjob-reconciler.yaml deploy/canary/cronjob-validator.yaml \
       deploy/canary/envoyfilter.yaml deploy/canary/deployment-config-agent.yaml \
       deploy/canary/configmap-validator-data.yaml deploy/canary/serviceaccount.yaml \
-      deploy/canary/clusterrolebinding.yaml 2>/dev/null || true
+      deploy/canary/clusterrolebinding.yaml deploy/canary/postsync-validation.yaml \
+      2>/dev/null || true
 # Update kustomization to empty resources
 cat > deploy/canary/kustomization.yaml <<'KUSEOF'
 apiVersion: kustomize.config.k8s.io/v1beta1

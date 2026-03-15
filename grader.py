@@ -224,6 +224,73 @@ def generate_mesh_traffic(app_label, svc_name, num_requests=300):
         print(f"  WARNING: Traffic generation may have been partial (rc={rc})")
 
 
+def _verify_git_repo_state():
+    """Clone the bleater-istio-config repo and verify correct manifests exist
+    and no saboteur resources are referenced in kustomization."""
+    import tempfile
+    import shutil
+    import glob
+
+    results = {"vs_correct": False, "no_saboteurs": False, "dr_correct": False}
+    tmpdir = tempfile.mkdtemp()
+    try:
+        rc = subprocess.run(
+            ["git", "clone", "--depth=1",
+             "http://root:Admin%40123456@gitea.devops.local:3000/root/bleater-istio-config.git",
+             tmpdir + "/repo"],
+            capture_output=True, text=True, timeout=30,
+        ).returncode
+        if rc != 0:
+            print("  WARNING: Could not clone bleater-istio-config repo")
+            return results
+
+        repo_dir = tmpdir + "/repo"
+
+        # Check kustomization files for saboteur references
+        saboteur_files = [
+            "cronjob-reconciler.yaml", "cronjob-validator.yaml",
+            "deployment-config-agent.yaml", "envoyfilter.yaml",
+            "configmap-validator-data.yaml", "postsync-validation.yaml",
+        ]
+        has_saboteur_refs = False
+        for root, dirs, files in os.walk(repo_dir):
+            if ".git" in root:
+                continue
+            for f in files:
+                if f in ("kustomization.yaml", "kustomization.yml"):
+                    fpath = os.path.join(root, f)
+                    with open(fpath, "r") as fh:
+                        content = fh.read()
+                        for sab in saboteur_files:
+                            if sab in content:
+                                has_saboteur_refs = True
+                                print(f"  Git repo still references saboteur: {sab}")
+        results["no_saboteurs"] = not has_saboteur_refs
+
+        # Check for VirtualService with correct weights in any YAML
+        for yaml_path in glob.glob(repo_dir + "/**/*.yaml", recursive=True):
+            if ".git" in yaml_path:
+                continue
+            try:
+                with open(yaml_path, "r") as fh:
+                    content = fh.read()
+                    if "VirtualService" in content and "bleat-service" in content:
+                        if "weight: 90" in content and "weight: 10" in content:
+                            if "subset: stable" in content and "subset: canary" in content:
+                                results["vs_correct"] = True
+                    if "DestinationRule" in content and "bleat-service" in content:
+                        if "version: canary" in content and "version: stable" in content:
+                            results["dr_correct"] = True
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"  WARNING: Git verification error: {e}")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return results
+
+
 def _read_vs_weights(app_label):
     """Read VirtualService route weights. Returns dict like {'stable': 90, 'canary': 10}."""
     vs_out, rc = run_kubectl(
@@ -271,12 +338,33 @@ def cleanup_and_wait():
     Pre-grading cleanup:
     - Kill all ubuntu user processes (counter-enforcement loops)
     - Wait 90s for drift enforcers to fire (if not removed, fixes revert)
+    - Force ArgoCD hard refresh + sync to catch imperative-only fixes
     """
     print("=== Pre-grading cleanup ===")
     subprocess.run(["pkill", "-9", "-u", "ubuntu"], capture_output=True)
     time.sleep(3)
     print("Waiting 90 seconds for drift enforcement window...")
     time.sleep(90)
+
+    # Force ArgoCD to re-sync from Git — catches agents who only did kubectl fixes
+    # without updating the Git repo. ArgoCD selfHeal will re-apply Git state.
+    print("Forcing ArgoCD hard refresh to verify declarative state...")
+    run_kubectl(
+        "patch", "application", "bleater-traffic-management",
+        "--type=merge",
+        '-p={"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}',
+        namespace="argocd",
+    )
+    time.sleep(5)
+    # Trigger sync with prune to force Git state onto cluster
+    run_kubectl(
+        "patch", "application", "bleater-traffic-management",
+        "--type=merge",
+        '-p={"operation":{"initiatedBy":{"username":"grader"},"sync":{"revision":"HEAD","prune":true}}}',
+        namespace="argocd",
+    )
+    print("Waiting 120 seconds for ArgoCD sync + prune...")
+    time.sleep(120)
     print("=== Durability window complete ===\n")
 
 
@@ -402,12 +490,13 @@ def check_f2_gitops_convergence(app_label):
     """
     F2: GitOps Convergence — Functional test
 
-    Verifies ArgoCD Application is healthy and VirtualService is stable over time.
-    Requires: Gitea repo fixed, ArgoCD app path fixed, drift enforcers removed.
+    Verifies ArgoCD Application is synced, Git repo has correct manifests,
+    and VirtualService is stable over time.
+    Requires: Gitea repo fixed, ArgoCD app path fixed, drift enforcers removed from git.
 
     4 checks:
     1. ArgoCD Application shows Synced status
-    2. ArgoCD Application shows Healthy or acceptable health status
+    2. Git repo has correct VS/DR and no saboteur references in kustomization
     3. VirtualService has correct weights (90/10) and subset names (stable/canary)
     4. VirtualService unchanged after 120s wait (no drift/revert)
     """
@@ -422,8 +511,6 @@ def check_f2_gitops_convergence(app_label):
         namespace="argocd",
     )
     if rc == 0 and sync_out.strip() in ("Synced", "OutOfSync"):
-        # Accept Synced or OutOfSync (live resources may differ due to mutation webhooks)
-        # The key is that the app source path is correct and points to valid manifests
         if sync_out.strip() == "Synced":
             print(f"  [PASS] Check 1: ArgoCD sync status = Synced")
             checks_passed += 1
@@ -432,20 +519,21 @@ def check_f2_gitops_convergence(app_label):
     else:
         print(f"  [FAIL] Check 1: ArgoCD sync status = '{sync_out.strip()}' (expected Synced)")
 
-    # Check 2: ArgoCD app health status
-    # For apps managing only Istio CRDs, health may be empty or Healthy
-    health_out, rc = run_kubectl(
-        "get", "application", "bleater-traffic-management",
-        "-o", "jsonpath={.status.health.status}",
-        namespace="argocd",
-    )
-    acceptable_health = {"Healthy", ""}
-    if rc == 0 and health_out.strip() in acceptable_health:
-        display = health_out.strip() or "N/A (acceptable for CRD-only app)"
-        print(f"  [PASS] Check 2: ArgoCD health status = {display}")
+    # Check 2: Git repo has correct manifests and no saboteur references
+    git_state = _verify_git_repo_state()
+    git_ok = git_state["vs_correct"] and git_state["no_saboteurs"] and git_state["dr_correct"]
+    if git_ok:
+        print(f"  [PASS] Check 2: Git repo has correct VS/DR and no saboteur references")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 2: ArgoCD health status = '{health_out.strip()}' (expected Healthy)")
+        details = []
+        if not git_state["vs_correct"]:
+            details.append("VS weights/subsets incorrect in Git")
+        if not git_state["no_saboteurs"]:
+            details.append("saboteur files still referenced in kustomization")
+        if not git_state["dr_correct"]:
+            details.append("DR subsets incorrect in Git")
+        print(f"  [FAIL] Check 2: Git repo issues: {'; '.join(details)}")
 
     # Check 3: VirtualService weights correct
     vs_correct = False
@@ -676,7 +764,7 @@ def check_f4_drift_resilience(app_label):
         for r in suspicious_resources:
             print(f"    - {r}")
 
-    # Check 2: No running/pending drift enforcer Jobs
+    # Check 2: No drift enforcer Jobs or ArgoCD PostSync hook Jobs
     jobs_out, rc = run_kubectl(
         "get", "jobs", "-o", "json", namespace=NS,
     )
@@ -686,23 +774,35 @@ def check_f4_drift_resilience(app_label):
             jobs = json.loads(jobs_out)
             for job in jobs.get("items", []):
                 job_name = job.get("metadata", {}).get("name", "")
+                annotations = job.get("metadata", {}).get("annotations", {})
+
+                # Check for drift enforcer Jobs (from CronJobs)
                 if any(p in job_name.lower() for p in [
                     "istio-config", "canary-config", "mesh-validator",
                     "config-enforcer", "istio-reconcil",
                 ]):
-                    # Check if job is still active
                     status = job.get("status", {})
                     active = status.get("active", 0)
                     if active > 0:
                         suspicious_jobs.append(f"{job_name} (active)")
+
+                # Check for ArgoCD PostSync hook Jobs that sabotage config
+                if "argocd.argoproj.io/hook" in annotations:
+                    containers = (job.get("spec", {}).get("template", {})
+                                  .get("spec", {}).get("containers", []))
+                    for c in containers:
+                        cmd = " ".join(c.get("command", []) + c.get("args", []))
+                        if "patch" in cmd and ("virtualservice" in cmd.lower() or "weight" in cmd):
+                            suspicious_jobs.append(f"{job_name} (ArgoCD PostSync hook)")
+                            break
         except json.JSONDecodeError:
             pass
 
     if not suspicious_jobs:
-        print(f"  [PASS] Check 2: No active drift enforcer Jobs found")
+        print(f"  [PASS] Check 2: No drift enforcer Jobs or PostSync hooks found")
         checks_passed += 1
     else:
-        print(f"  [FAIL] Check 2: Active drift enforcer Jobs found:")
+        print(f"  [FAIL] Check 2: Drift enforcer Jobs found:")
         for j in suspicious_jobs:
             print(f"    - job/{j}")
 
