@@ -231,7 +231,8 @@ def _verify_git_repo_state():
     import shutil
     import glob
 
-    results = {"vs_correct": False, "no_saboteurs": False, "dr_correct": False}
+    results = {"vs_correct": False, "no_saboteurs": False, "dr_correct": False,
+               "canary_deploy_in_git": False}
     tmpdir = tempfile.mkdtemp()
     try:
         rc = subprocess.run(
@@ -304,6 +305,11 @@ def _verify_git_repo_state():
                     if "DestinationRule" in content and "bleat-service" in content:
                         if "version: canary" in content and "version: stable" in content:
                             results["dr_correct"] = True
+                    if "Deployment" in content and "canary" in content:
+                        if ("sidecar.istio.io/inject" in content and
+                                "version: canary" in content and
+                                "app: bleat-service" in content):
+                            results["canary_deploy_in_git"] = True
             except Exception:
                 pass
     except Exception as e:
@@ -371,17 +377,19 @@ def cleanup_and_wait():
 
     # Force ArgoCD to hard-refresh repo cache and let auto-sync re-apply Git state.
     # This catches agents who only did kubectl fixes without updating Git.
-    # We do NOT manually trigger sync — that would race the repo cache refresh
-    # and use stale manifests (including PostSync hooks the agent already removed).
+    # We do multiple refresh cycles to ensure ArgoCD processes the refresh reliably.
     print("Forcing ArgoCD hard refresh to verify declarative state...")
-    run_kubectl(
-        "patch", "application", "bleater-traffic-management",
-        "--type=merge",
-        '-p={"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}',
-        namespace="argocd",
-    )
-    print("Waiting 180 seconds for ArgoCD auto-sync from fresh repo cache...")
-    time.sleep(180)
+    for cycle in range(3):
+        run_kubectl(
+            "patch", "application", "bleater-traffic-management",
+            "--type=merge",
+            '-p={"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}',
+            namespace="argocd",
+        )
+        if cycle < 2:
+            time.sleep(60)
+    print("Waiting 120 seconds for ArgoCD auto-sync from fresh repo cache...")
+    time.sleep(120)
     print("=== Durability window complete ===\n")
 
 
@@ -553,9 +561,10 @@ def check_f2_gitops_convergence(app_label):
 
     # Check 2: Git repo has correct manifests and no saboteur references
     git_state = _verify_git_repo_state()
-    git_ok = git_state["vs_correct"] and git_state["no_saboteurs"] and git_state["dr_correct"]
+    git_ok = (git_state["vs_correct"] and git_state["no_saboteurs"] and
+              git_state["dr_correct"] and git_state.get("canary_deploy_in_git", False))
     if git_ok:
-        print(f"  ✅ Check 2: Git repo has correct VS/DR and no saboteur references")
+        print(f"  ✅ Check 2: Git repo has correct VS/DR/canary-deploy and no saboteur references")
         checks_passed += 1
     else:
         details = []
@@ -565,6 +574,8 @@ def check_f2_gitops_convergence(app_label):
             details.append("saboteur files still referenced in kustomization")
         if not git_state["dr_correct"]:
             details.append("DR subsets incorrect in Git")
+        if not git_state.get("canary_deploy_in_git", False):
+            details.append("canary Deployment with sidecar injection + version label not in Git")
         print(f"  ❌ Check 2: Git repo issues: {'; '.join(details)}")
 
     # Check 3: VirtualService weights correct
@@ -789,9 +800,28 @@ def check_f4_drift_resilience(app_label):
         except json.JSONDecodeError:
             pass
 
-    if not suspicious_resources:
-        print(f"  ✅ Check 1: No drift enforcer CronJobs or Deployments found")
+    # Also verify ArgoCD app has prune + selfHeal enabled (declarative enforcement)
+    app_out, rc = run_kubectl(
+        "get", "application", "bleater-traffic-management",
+        "-o", "json", namespace="argocd",
+    )
+    prune_enabled = False
+    self_heal_enabled = False
+    if rc == 0 and app_out:
+        try:
+            app = json.loads(app_out)
+            automated = app.get("spec", {}).get("syncPolicy", {}).get("automated", {})
+            prune_enabled = automated.get("prune", False)
+            self_heal_enabled = automated.get("selfHeal", False)
+        except json.JSONDecodeError:
+            pass
+
+    if not suspicious_resources and prune_enabled and self_heal_enabled:
+        print(f"  ✅ Check 1: No drift enforcers, ArgoCD prune+selfHeal enabled")
         checks_passed += 1
+    elif not suspicious_resources and (not prune_enabled or not self_heal_enabled):
+        print(f"  ❌ Check 1: No drift enforcers found but ArgoCD prune={prune_enabled}, "
+              f"selfHeal={self_heal_enabled} (not declaratively enforced)")
     else:
         print(f"  ❌ Check 1: Drift enforcer resources still present:")
         for r in suspicious_resources:

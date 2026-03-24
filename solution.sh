@@ -28,6 +28,10 @@ echo "  K8s service name: $SVC_NAME"
 SVC_PORT=$(kubectl get svc "$SVC_NAME" -n "$NS" -o jsonpath='{.spec.ports[0].port}' 2>/dev/null)
 SVC_PORT=${SVC_PORT:-8003}
 echo "  Service port: $SVC_PORT"
+
+# Discover bleat-service image
+BLEAT_IMAGE=$(kubectl get deployment "$BLEAT_DEPLOY" -n "$NS" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)
+BLEAT_IMAGE=${BLEAT_IMAGE:-harbor.devops.local/bleater/bleat-service:latest}
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -300,22 +304,74 @@ rm -f deploy/canary/cronjob-reconciler.yaml deploy/canary/cronjob-validator.yaml
 cp deploy/istio/virtualservice.yaml deploy/canary/virtualservice.yaml
 cp deploy/istio/destinationrule.yaml deploy/canary/destinationrule.yaml
 
-# Update kustomization to reference only the correct manifests
+# Add canary Deployment manifest to Git (declarative management)
+cat > deploy/canary/deployment-canary.yaml <<CANDEPEOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${BLEAT_DEPLOY}-canary
+  namespace: bleater
+  labels:
+    app: ${STABLE_APP_LABEL}
+    role: canary-release
+    track: canary
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ${STABLE_APP_LABEL}
+      track: canary
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "${SVC_PORT}"
+        sidecar.istio.io/inject: "true"
+      labels:
+        app: ${STABLE_APP_LABEL}
+        track: canary
+        version: canary
+    spec:
+      containers:
+      - name: bleat-service
+        image: ${BLEAT_IMAGE}
+        ports:
+        - containerPort: ${SVC_PORT}
+          name: http
+          protocol: TCP
+        env:
+        - name: CANARY_VERSION
+          value: "v2.1.0"
+        - name: DEPLOYMENT_TRACK
+          value: "canary"
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+CANDEPEOF
+echo "  deploy/canary/deployment-canary.yaml created (declarative canary management)"
+
+# Update kustomization to reference VS, DR, and canary Deployment
 cat > deploy/canary/kustomization.yaml <<'KUSEOF'
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
 - virtualservice.yaml
 - destinationrule.yaml
+- deployment-canary.yaml
 KUSEOF
-echo "  deploy/canary/ fixed: sabotaging resources replaced with correct VS/DR"
+echo "  deploy/canary/ fixed: sabotaging resources replaced with correct VS/DR + canary deployment"
 
 git add -A
-git commit -m "fix: correct canary VirtualService weights and subset names
+git commit -m "fix: correct canary traffic management and declarative deployment
 
 - Set traffic split to 90/10 (stable/canary)
 - Fix subset name from canary-v2 to canary
 - Align DestinationRule subset selectors with pod labels
+- Add canary Deployment manifest (sidecar injection, version label)
 - Remove drift enforcement resources from deploy/canary/
 
 Fixes: PLAT-4521" 2>/dev/null

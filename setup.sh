@@ -546,6 +546,11 @@ This directory contains the platform configuration reconciliation
 resources managed by the platform-ops team. These ensure Istio
 configuration consistency across the bleater namespace.
 
+All traffic management resources (VirtualService, DestinationRule,
+Deployment manifests for canary workloads) should be committed here
+so ArgoCD manages them declaratively. Imperative kubectl changes
+will drift on the next sync cycle.
+
 Changes require platform-ops team approval.
 Contact: #platform-ops on Mattermost
 DECOYEOF
@@ -1520,6 +1525,7 @@ WIKI_INCIDENT=$(cat <<'WIKICONTENT'
 - [ ] Check Istio CA certificate issuance for canary pods
 - [ ] Review canary-rollout-controller logs
 - [ ] Consider disabling selfHeal on ArgoCD temporarily
+- [ ] Add canary Deployment manifest to bleater-istio-config repo (currently unmanaged by GitOps)
 WIKICONTENT
 )
 
@@ -1609,7 +1615,8 @@ except: print('')
                 "Tried setting PeerAuthentication to PERMISSIVE mode for the bleater namespace — didn't help. The canary pods still show no incoming connections in the Envoy access logs. Maybe it's not an mTLS issue?" \
                 "I think the canary image itself might be broken — when I curl the canary pod directly, I'm getting 503 errors with 'upstream connect error'. Could be a bad build?" \
                 "I manually patched the VirtualService weights to 90/10 with kubectl patch, but they keep reverting back to 100/0 within a few minutes. Something is overwriting my changes. Has anyone checked if there's a controller or sync process that manages the VirtualService?" \
-                "Checked the HPA for canary — the bleater-canary-autoscaler has minReplicas: 0. That might be why the canary keeps getting scaled down during off-peak. Let me try setting it to 1."; do
+                "Checked the HPA for canary — the bleater-canary-autoscaler has minReplicas: 0. That might be why the canary keeps getting scaled down during off-peak. Let me try setting it to 1." \
+                "Also — the canary deployment was applied manually with kubectl, it's not in the bleater-istio-config Git repo yet. We need to add the canary Deployment manifest there so ArgoCD manages it declaratively. Otherwise the sidecar/label config will drift on the next rollout."; do
                 curl -sf -X POST -H "Authorization: Bearer ${MM_TOKEN}" \
                     -H "Content-Type: application/json" \
                     "${MATTERMOST_URL}/api/v4/posts" \
