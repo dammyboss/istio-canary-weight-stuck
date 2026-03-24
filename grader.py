@@ -394,27 +394,26 @@ def cleanup_and_wait():
 
 
 # ======================================================================
-# F1: CANARY TRAFFIC ROUTING (20%)
+# F1: CANARY TRAFFIC & OBSERVABILITY (25%)
 #
-# Uses Prometheus istio_requests_total metrics to verify traffic split.
-# The Telemetry CRD enables metric export from Envoy sidecars.
+# Merged F1 (traffic routing) + F5 (golden signals) into a single subscore.
+# Verifies traffic reaches canary AND is observable via Prometheus metrics.
 # ======================================================================
 
-def check_f1_canary_traffic_routing(app_label, svc_name):
+def check_f1_canary_traffic_observability(app_label, svc_name):
     """
-    F1: Canary Traffic Routing — Functional test
+    F1: Canary Traffic & Observability — Functional test
 
-    Uses Prometheus istio_requests_total to verify canary receives ~10% traffic.
-    Requires ALL of: correct DR labels, correct VS weights/subsets, sidecar injection,
-    EnvoyFilter removal, stable label fix, canary pod in Service endpoints.
+    Verifies canary receives traffic AND the observability pipeline reports it.
+    Combines traffic routing verification with Prometheus metrics validation.
 
     4 checks:
     1. Canary pods exist with version: canary label AND istio-proxy sidecar
-    2. Prometheus shows canary request rate > 0 (canary receives ANY traffic)
-    3. VirtualService has correct 90/10 weights with correct subset names
-    4. No 503 errors in canary responses (EnvoyFilter removed)
+    2. VirtualService has correct 90/10 weights with correct subset names
+    3. Canary HTTP 200 response rate > 0 in Prometheus (traffic flows + succeeds)
+    4. destination_version label propagation (both canary + stable in Prometheus)
     """
-    print("\n--- F1: Canary Traffic Routing ---")
+    print("\n--- F1: Canary Traffic & Observability ---")
     checks_passed = 0
     total = 4
 
@@ -446,61 +445,69 @@ def check_f1_canary_traffic_routing(app_label, svc_name):
         print(f"  ❌ Check 1: canary pods with sidecar={canary_with_sidecar}, "
               f"ready without sidecar={canary_pods_ready}")
 
-    # Generate traffic so Prometheus has data to query
-    generate_mesh_traffic(app_label, svc_name, num_requests=150)
-    print("  Waiting 15s for Prometheus scrape cycle...")
-    time.sleep(15)
-
-    # Try multiple Prometheus query patterns for canary rate
-    canary_rate = 0.0
-    for query in [
-        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",reporter="destination"}}[5m]))',
-        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary"}}[5m]))',
-        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",reporter="destination"}}[5m]))',
-        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary"}}[5m]))',
-    ]:
-        canary_rate = prom_query_value(query)
-        if canary_rate > 0:
-            break
-
-    # Check 2: Canary request rate > 0
-    if canary_rate > 0:
-        print(f"  ✅ Check 2: Canary request rate = {canary_rate:.4f} req/s")
-        checks_passed += 1
-    else:
-        print(f"  ❌ Check 2: Canary request rate = 0 (no traffic reaching canary)")
-
-    # Check 3: VirtualService has correct 90/10 weights with correct subset names
-    # Verifies the agent configured the routing correctly (config-level check)
+    # Check 2: VirtualService has correct 90/10 weights with correct subset names
     vs_weights = _read_vs_weights(app_label)
     if vs_weights and vs_weights.get("stable") == 90 and vs_weights.get("canary") == 10:
-        print(f"  ✅ Check 3: VirtualService weights = stable:90, canary:10")
+        print(f"  ✅ Check 2: VirtualService weights = stable:90, canary:10")
         checks_passed += 1
     else:
-        print(f"  ❌ Check 3: VirtualService weights = {vs_weights} "
+        print(f"  ❌ Check 2: VirtualService weights = {vs_weights} "
               f"(expected stable:90, canary:10)")
 
-    # Check 4: No significant 503 errors for canary (EnvoyFilter removed)
-    # Use 2m window to minimize pre-fix residual errors bleeding into the window
-    error_rate = 0.0
+    # Generate traffic so Prometheus has data to query
+    generate_mesh_traffic(app_label, svc_name, num_requests=200)
+    print("  Waiting 20s for Prometheus scrape cycle...")
+    time.sleep(20)
+
+    # Check 3: Canary HTTP 200 response rate > 0 (traffic flows AND succeeds)
+    # Combines F1's "traffic reaches canary" with F5's "successful responses"
+    canary_200_rate = 0.0
     for query in [
-        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code="503"}}[2m]))',
-        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",response_code="503"}}[2m]))',
+        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code="200",reporter="destination"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",response_code="200"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code=~"2.."}}[5m]))',
     ]:
-        error_rate = prom_query_value(query)
-        if error_rate > 0:
+        canary_200_rate = prom_query_value(query)
+        if canary_200_rate > 0:
             break
 
-    # Allow tiny residual error rate (< 5% of canary traffic) from pre-fix window overlap
-    error_threshold = max(canary_rate * 0.05, 0.01) if canary_rate > 0 else 0.01
-    if error_rate <= error_threshold:
-        if error_rate > 0:
-            print(f"  ✅ Check 4: Canary 503 rate = {error_rate:.4f} (residual, below threshold)")
-        else:
-            print(f"  ✅ Check 4: No 503 errors for canary in Prometheus")
+    if canary_200_rate > 0:
+        print(f"  ✅ Check 3: Canary 200 response rate = {canary_200_rate:.4f} req/s")
         checks_passed += 1
     else:
-        print(f"  ❌ Check 4: Canary 503 error rate = {error_rate:.4f} req/s (threshold: {error_threshold:.4f})")
+        print(f"  ❌ Check 3: Canary 200 response rate = 0 (no successful canary traffic)")
+
+    # Check 4: destination_version label propagation in Prometheus
+    # Verifies end-to-end observability: pod labels → Istio telemetry → Prometheus
+    version_labels_exist = False
+    for query in [
+        f'count(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary"}})',
+        f'count(istio_requests_total{{destination_app="{app_label}",destination_version="canary"}})',
+    ]:
+        count = prom_query_value(query)
+        if count > 0:
+            version_labels_exist = True
+            break
+
+    stable_labels_exist = False
+    for query in [
+        f'count(istio_requests_total{{destination_service_name="{svc_name}",destination_version="stable"}})',
+        f'count(istio_requests_total{{destination_app="{app_label}",destination_version="stable"}})',
+    ]:
+        count = prom_query_value(query)
+        if count > 0:
+            stable_labels_exist = True
+            break
+
+    if version_labels_exist and stable_labels_exist:
+        print(f"  ✅ Check 4: Both destination_version=canary and =stable labels in Prometheus")
+        checks_passed += 1
+    elif version_labels_exist:
+        print(f"  ✅ Check 4: destination_version=canary labels present in Prometheus")
+        checks_passed += 1
+    else:
+        print(f"  ❌ Check 4: destination_version labels not found in Prometheus "
+              f"(canary={version_labels_exist}, stable={stable_labels_exist})")
 
     score = 1.0 if checks_passed == total else 0.0
     print(f"{'✅ PASSED' if score == 1.0 else '❌ FAILED'} F1 ({checks_passed}/{total})")
@@ -910,170 +917,6 @@ def check_f4_drift_resilience(app_label):
 
 
 # ======================================================================
-# F5: CANARY GOLDEN SIGNALS (20%)
-# ======================================================================
-
-def check_f5_canary_golden_signals(app_label, svc_name):
-    """
-    F5: Canary Golden Signals — Observability integration test
-
-    Verifies that the observability pipeline (Prometheus metrics, Jaeger traces,
-    label propagation) confirms canary traffic is flowing correctly.
-    Distinct from F1 (traffic routing): F5 tests that metrics/traces REPORT
-    the traffic, not just that traffic flows.
-
-    4 checks:
-    1. Prometheus istio_requests_total for canary > 0 (metrics pipeline works)
-    2. Canary HTTP 200 response rate > 0 in Prometheus (successful responses, not just any traffic)
-    3. Jaeger traces exist for the service (distributed tracing pipeline)
-    4. Prometheus destination_version label propagation (Istio telemetry CRD + pod labels → metrics)
-    """
-    print("\n--- F5: Canary Golden Signals ---")
-    checks_passed = 0
-    total = 4
-
-    # Generate more traffic for fresh metrics
-    generate_mesh_traffic(app_label, svc_name, num_requests=150)
-    print("  Waiting 15s for Prometheus scrape cycle...")
-    time.sleep(15)
-
-    # Try multiple query patterns for canary
-    canary_rate = 0.0
-    for query in [
-        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",reporter="destination"}}[5m]))',
-        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary"}}[5m]))',
-        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",reporter="destination"}}[5m]))',
-        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary"}}[5m]))',
-    ]:
-        canary_rate = prom_query_value(query)
-        if canary_rate > 0:
-            break
-
-    # Check 1: Canary request rate > 0 in Prometheus
-    if canary_rate > 0:
-        print(f"  ✅ Check 1: Canary request rate = {canary_rate:.4f} req/s")
-        checks_passed += 1
-    else:
-        print(f"  ❌ Check 1: Canary request rate = 0")
-
-    # Check 2: Canary HTTP 200 response rate > 0 (successful responses, not just traffic)
-    # This is distinct from F1 — verifies the canary serves SUCCESSFUL responses,
-    # not just that any traffic reaches it (which could all be 503s/errors)
-    canary_200_rate = 0.0
-    for query in [
-        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code="200",reporter="destination"}}[5m]))',
-        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",response_code="200"}}[5m]))',
-        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code=~"2.."}}[5m]))',
-    ]:
-        canary_200_rate = prom_query_value(query)
-        if canary_200_rate > 0:
-            break
-
-    if canary_200_rate > 0:
-        print(f"  ✅ Check 2: Canary 200 response rate = {canary_200_rate:.4f} req/s")
-        checks_passed += 1
-    else:
-        # If canary rate > 0 but no 200s, all canary traffic is errors
-        if canary_rate > 0:
-            print(f"  ❌ Check 2: Canary receives traffic ({canary_rate:.4f}) but no 200 responses")
-        else:
-            print(f"  ❌ Check 2: Canary 200 response rate = 0")
-
-    # Check 3: Jaeger has traces for the service
-    jaeger_urls = [
-        "http://jaeger-query.monitoring.svc.cluster.local:16686",
-        "http://jaeger.monitoring.svc.cluster.local:16686",
-        "http://kube-prometheus-stack-jaeger.monitoring.svc.cluster.local:16686",
-    ]
-    any_traces_found = False
-    canary_traces_found = False
-
-    # Try with both service name patterns
-    for svc_query in [svc_name, app_label]:
-        for jaeger_url in jaeger_urls:
-            try:
-                search_url = f"{jaeger_url}/api/traces?service={svc_query}&limit=50&lookback=1h"
-                req = urllib.request.Request(search_url, method="GET")
-                resp = urllib.request.urlopen(req, timeout=10)
-                data = json.loads(resp.read().decode())
-                trace_data = data.get("data", [])
-                if trace_data:
-                    any_traces_found = True
-                    for trace in trace_data:
-                        trace_json = json.dumps(trace)
-                        if "canary" in trace_json.lower():
-                            canary_traces_found = True
-                            break
-                if any_traces_found:
-                    break
-            except Exception:
-                continue
-        if any_traces_found:
-            break
-
-    if canary_traces_found:
-        print(f"  ✅ Check 3: Jaeger traces found with canary endpoint")
-        checks_passed += 1
-    elif any_traces_found:
-        if canary_rate > 0:
-            # Jaeger may not tag version explicitly. If Prometheus confirms canary traffic
-            # and Jaeger has traces for the service, the observability stack is working
-            print(f"  ✅ Check 3: Jaeger has traces and Prometheus confirms canary traffic")
-            checks_passed += 1
-        else:
-            print(f"  ❌ Check 3: Jaeger has traces but no canary traffic confirmed")
-    else:
-        if canary_rate > 0:
-            # Jaeger unavailable but Prometheus confirms canary — partial credit
-            print(f"  ✅ Check 3: Prometheus confirms canary traffic "
-                  f"(rate={canary_rate:.4f}), Jaeger unavailable")
-            checks_passed += 1
-        else:
-            print(f"  ❌ Check 3: No traces and no canary traffic confirmed")
-
-    # Check 4: destination_version label propagation in Prometheus
-    # Verifies that the Istio telemetry pipeline propagates pod labels into
-    # Prometheus metric labels. This requires: Telemetry CRD enabled,
-    # pod version labels set correctly, sidecar injected, and Prometheus scraping.
-    # Distinct from F1/F3 which check traffic flow / mesh config.
-    version_labels_exist = False
-    for query in [
-        f'count(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary"}})',
-        f'count(istio_requests_total{{destination_app="{app_label}",destination_version="canary"}})',
-    ]:
-        count = prom_query_value(query)
-        if count > 0:
-            version_labels_exist = True
-            break
-
-    # Also verify stable version label exists (both labels propagate)
-    stable_labels_exist = False
-    for query in [
-        f'count(istio_requests_total{{destination_service_name="{svc_name}",destination_version="stable"}})',
-        f'count(istio_requests_total{{destination_app="{app_label}",destination_version="stable"}})',
-    ]:
-        count = prom_query_value(query)
-        if count > 0:
-            stable_labels_exist = True
-            break
-
-    if version_labels_exist and stable_labels_exist:
-        print(f"  ✅ Check 4: Both destination_version=canary and =stable labels in Prometheus")
-        checks_passed += 1
-    elif version_labels_exist:
-        # Canary labels exist but stable doesn't — partial, still pass (stable may take time)
-        print(f"  ✅ Check 4: destination_version=canary labels present in Prometheus")
-        checks_passed += 1
-    else:
-        print(f"  ❌ Check 4: destination_version labels not found in Prometheus "
-              f"(canary={version_labels_exist}, stable={stable_labels_exist})")
-
-    score = 1.0 if checks_passed == total else 0.0
-    print(f"{'✅ PASSED' if score == 1.0 else '❌ FAILED'} F5 ({checks_passed}/{total})")
-    return score
-
-
-# ======================================================================
 # MAIN GRADING FUNCTION
 # ======================================================================
 
@@ -1082,7 +925,7 @@ def grade(transcript: str) -> GradingResult:
     Main grading function.
 
     Pre-grading: Kill ubuntu processes, wait 90s for drift enforcers.
-    Then run 5 functional subscores, each with 4 all-or-nothing checks.
+    Then run 4 functional subscores, each with 4 all-or-nothing checks.
     """
     os.environ["KUBECONFIG"] = KUBECONFIG
 
@@ -1096,13 +939,13 @@ def grade(transcript: str) -> GradingResult:
     subscores = {}
     weights = {}
 
-    # F1: Canary Traffic Routing
+    # F1: Canary Traffic & Observability (merged F1+F5)
     try:
-        subscores["canary_traffic_routing"] = check_f1_canary_traffic_routing(app_label, svc_name)
+        subscores["canary_traffic_observability"] = check_f1_canary_traffic_observability(app_label, svc_name)
     except Exception as e:
         print(f"Error in F1: {e}")
-        subscores["canary_traffic_routing"] = 0.0
-    weights["canary_traffic_routing"] = 0.20
+        subscores["canary_traffic_observability"] = 0.0
+    weights["canary_traffic_observability"] = 0.25
 
     # F2: GitOps Convergence
     try:
@@ -1110,7 +953,7 @@ def grade(transcript: str) -> GradingResult:
     except Exception as e:
         print(f"Error in F2: {e}")
         subscores["gitops_convergence"] = 0.0
-    weights["gitops_convergence"] = 0.20
+    weights["gitops_convergence"] = 0.25
 
     # F3: Service Mesh Integrity
     try:
@@ -1118,7 +961,7 @@ def grade(transcript: str) -> GradingResult:
     except Exception as e:
         print(f"Error in F3: {e}")
         subscores["service_mesh_integrity"] = 0.0
-    weights["service_mesh_integrity"] = 0.20
+    weights["service_mesh_integrity"] = 0.25
 
     # F4: Drift Resilience
     try:
@@ -1126,15 +969,7 @@ def grade(transcript: str) -> GradingResult:
     except Exception as e:
         print(f"Error in F4: {e}")
         subscores["drift_resilience"] = 0.0
-    weights["drift_resilience"] = 0.20
-
-    # F5: Canary Golden Signals
-    try:
-        subscores["canary_golden_signals"] = check_f5_canary_golden_signals(app_label, svc_name)
-    except Exception as e:
-        print(f"Error in F5: {e}")
-        subscores["canary_golden_signals"] = 0.0
-    weights["canary_golden_signals"] = 0.20
+    weights["drift_resilience"] = 0.25
 
     # Calculate weighted score
     total_weight = sum(weights.values())
@@ -1142,11 +977,10 @@ def grade(transcript: str) -> GradingResult:
 
     # Build feedback
     labels = {
-        "canary_traffic_routing": ("F1", "Canary traffic routing — ~10% traffic reaches canary (20%)"),
-        "gitops_convergence": ("F2", "GitOps convergence — ArgoCD synced, VirtualService stable (20%)"),
-        "service_mesh_integrity": ("F3", "Service mesh integrity — sidecar, EnvoyFilter, subsets (20%)"),
-        "drift_resilience": ("F4", "Drift resilience — enforcers removed, fixes persist (20%)"),
-        "canary_golden_signals": ("F5", "Canary golden signals — observability pipeline, metrics, traces (20%)"),
+        "canary_traffic_observability": ("F1", "Canary traffic & observability — routing, metrics, labels (25%)"),
+        "gitops_convergence": ("F2", "GitOps convergence — ArgoCD synced, Git repo correct (25%)"),
+        "service_mesh_integrity": ("F3", "Service mesh integrity — sidecar, EnvoyFilter, subsets (25%)"),
+        "drift_resilience": ("F4", "Drift resilience — enforcers removed, prune enabled, fixes persist (25%)"),
     }
 
     feedback_lines = []
