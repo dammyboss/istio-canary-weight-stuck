@@ -268,7 +268,7 @@ def _verify_git_repo_state():
         # Also check that saboteur files don't physically exist with active content
         sabotage_patterns = [
             "weight: 100", "weight: 0",
-            "kubectl patch", "envoy.filters.http.lua",
+            "kubectl patch", ":respond(",
             "istio-config-reconciler", "mesh-validator",
             "platform-config-agent", "config-enforcer",
             "postsync-validation",
@@ -655,7 +655,8 @@ def check_f3_service_mesh_integrity(app_label):
                 for patch in patches:
                     patch_value = json.dumps(patch.get("patch", {}).get("value", {}))
                     if any(indicator in patch_value for indicator in [
-                        ":respond(", "503", ":abort", "envoy.filters.http.lua"
+                        ":respond(", ":abort(",
+                        '":status"] = "503"', '":status"]=\\"503\\"',
                     ]):
                         has_fault_injection = True
                         print(f"  ❌ Check 2: EnvoyFilter '{ef_name}' contains fault injection")

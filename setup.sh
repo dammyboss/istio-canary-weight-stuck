@@ -1676,12 +1676,140 @@ echo ""
 
 echo "Phase 10: Finalization..."
 
-# Create kubeconfig for ubuntu user (agent uses regular kubectl, no sudo)
+# Create scoped RBAC for agent (not cluster-admin)
+kubectl apply -f - <<'RBAC_EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ubuntu-agent
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ubuntu-agent-role
+rules:
+# Core resources — read across cluster
+- apiGroups: [""]
+  resources: ["pods", "endpoints", "events"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["namespaces"]
+  verbs: ["get", "list", "watch"]
+# Services — full CRUD (agent needs to discover Gitea ClusterIP etc.)
+- apiGroups: [""]
+  resources: ["services"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# ConfigMaps and Secrets — full CRUD (needed across namespaces)
+- apiGroups: [""]
+  resources: ["configmaps", "secrets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# ServiceAccounts
+- apiGroups: [""]
+  resources: ["serviceaccounts"]
+  verbs: ["get", "list", "watch", "create", "update", "patch"]
+# Pod exec and logs (needed for debugging and traffic generation)
+- apiGroups: [""]
+  resources: ["pods/exec", "pods/log"]
+  verbs: ["get", "create"]
+# Apps: Deployments, ReplicaSets, StatefulSets, DaemonSets
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Batch: Jobs, CronJobs
+- apiGroups: ["batch"]
+  resources: ["jobs", "cronjobs"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# HPA (for investigating decoy)
+- apiGroups: ["autoscaling"]
+  resources: ["horizontalpodautoscalers"]
+  verbs: ["get", "list", "watch", "update", "patch", "delete"]
+# Istio CRDs
+- apiGroups: ["networking.istio.io"]
+  resources: ["virtualservices", "destinationrules", "envoyfilters", "gateways", "serviceentries", "sidecars"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: ["security.istio.io"]
+  resources: ["peerauthentications", "authorizationpolicies", "requestauthentications"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# ArgoCD Applications
+- apiGroups: ["argoproj.io"]
+  resources: ["applications", "applicationsets", "appprojects"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# RBAC (read + delete only — agent may need to remove drift-enforcer bindings)
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterroles", "clusterrolebindings", "roles", "rolebindings"]
+  verbs: ["get", "list", "watch", "delete"]
+# CRDs (read-only for investigation)
+- apiGroups: ["apiextensions.k8s.io"]
+  resources: ["customresourcedefinitions"]
+  verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ubuntu-agent-binding
+subjects:
+- kind: ServiceAccount
+  name: ubuntu-agent
+  namespace: default
+roleRef:
+  kind: ClusterRole
+  name: ubuntu-agent-role
+  apiGroup: rbac.authorization.k8s.io
+RBAC_EOF
+echo "  Scoped RBAC created for ubuntu-agent ServiceAccount"
+
+# Generate a scoped kubeconfig for ubuntu using the ServiceAccount token
+APISERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+SA_TOKEN=$(kubectl create token ubuntu-agent -n default --duration=87600h 2>/dev/null || \
+    kubectl get secret -n default -o jsonpath='{.items[?(@.metadata.annotations.kubernetes\.io/service-account\.name=="ubuntu-agent")].data.token}' 2>/dev/null | base64 -d)
+
+# If token creation failed, create a Secret-based token (for older k8s)
+if [ -z "$SA_TOKEN" ]; then
+    kubectl apply -f - <<'TOKEN_EOF'
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ubuntu-agent-token
+  namespace: default
+  annotations:
+    kubernetes.io/service-account.name: ubuntu-agent
+type: kubernetes.io/service-account-token
+TOKEN_EOF
+    sleep 3
+    SA_TOKEN=$(kubectl get secret ubuntu-agent-token -n default -o jsonpath='{.data.token}' | base64 -d)
+fi
+
+CA_DATA=$(cat /etc/rancher/k3s/k3s.yaml | grep certificate-authority-data | head -1 | awk '{print $2}')
+
 mkdir -p /home/ubuntu/.kube
-cp /etc/rancher/k3s/k3s.yaml /home/ubuntu/.kube/config
+cat > /home/ubuntu/.kube/config <<KUBEEOF
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    certificate-authority-data: ${CA_DATA}
+    server: ${APISERVER}
+  name: default
+contexts:
+- context:
+    cluster: default
+    user: ubuntu-agent
+  name: default
+current-context: default
+users:
+- name: ubuntu-agent
+  user:
+    token: ${SA_TOKEN}
+KUBEEOF
 chown -R ubuntu:ubuntu /home/ubuntu/.kube
 chmod 600 /home/ubuntu/.kube/config
-echo "  Ubuntu kubeconfig created at /home/ubuntu/.kube/config"
+
+# Lock down the admin kubeconfig — ubuntu cannot read it
+chmod 600 /etc/rancher/k3s/k3s.yaml
+chown root:root /etc/rancher/k3s/k3s.yaml
+
+echo "  Ubuntu scoped kubeconfig configured at /home/ubuntu/.kube/config"
 
 # Strip last-applied-configuration annotations to prevent reverse-engineering
 for kind in virtualservice destinationrule envoyfilter; do
