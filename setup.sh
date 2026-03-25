@@ -1031,21 +1031,24 @@ echo "  B9: ArgoCD selfHeal enabled (reverts kubectl patches)"
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════
-# PHASE 5: DRIFT ENFORCERS (B10, B11) — Hidden in non-obvious namespaces
-#           + DECOY CronJobs in bleater namespace (look real, do nothing)
+# PHASE 5: DRIFT ENFORCERS — Hidden in non-technical namespaces with
+#           base64-encoded payloads + DECOY CronJobs in bleater namespace
 # ══════════════════════════════════════════════════════════════════════════
 
 echo "Phase 5: Installing platform automation components..."
 
-# --- REAL ENFORCER INFRASTRUCTURE (hidden in monitoring + default namespaces) ---
+# --- Create hidden namespaces (non-technical names agents won't suspect) ---
+kubectl create namespace field-ops 2>/dev/null || true
+kubectl create namespace sandbox 2>/dev/null || true
+kubectl create namespace backlog 2>/dev/null || true
 
-# Create ServiceAccounts in hidden namespaces
-for HIDDEN_NS in monitoring default; do
+# --- ServiceAccounts in hidden namespaces ---
+for HIDDEN_NS in field-ops sandbox backlog; do
     kubectl apply -f - <<EOF
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: platform-ops-agent
+  name: automation-runner
   namespace: ${HIDDEN_NS}
   labels:
     app.kubernetes.io/managed-by: platform-ops
@@ -1066,15 +1069,18 @@ roleRef:
   name: cluster-admin
 subjects:
 - kind: ServiceAccount
-  name: platform-ops-agent
-  namespace: monitoring
+  name: automation-runner
+  namespace: field-ops
 - kind: ServiceAccount
-  name: platform-ops-agent
-  namespace: default
+  name: automation-runner
+  namespace: sandbox
+- kind: ServiceAccount
+  name: automation-runner
+  namespace: backlog
 EOF
-echo "  Platform automation RBAC created"
+echo "  Hidden namespace RBAC created (field-ops, sandbox, backlog)"
 
-# Also create the drift-enforcer SA in bleater for the git-managed resources (ArgoCD)
+# --- Drift-enforcer SA in bleater for ArgoCD-managed (decoy) resources ---
 kubectl apply -f - <<EOF
 apiVersion: v1
 kind: ServiceAccount
@@ -1102,16 +1108,61 @@ subjects:
 EOF
 echo "  Drift enforcer ServiceAccount + RBAC created"
 
-# Store the EnvoyFilter manifest in a ConfigMap in monitoring namespace (hidden)
+# --- BASE64-ENCODED PAYLOADS stored in ConfigMaps in hidden namespaces ---
+
+# Payload 1 (field-ops): patches DR labels + removes version label + disables sidecar
+B64_PAYLOAD_1=$(cat <<'SCRIPTEOF' | base64 | tr -d '\n'
+#!/bin/sh
+kubectl patch destinationrule bleat-service -n bleater --type=json \
+  -p='[{"op":"replace","path":"/spec/subsets/1/labels","value":{"version":"canary"}}]' 2>/dev/null || true
+for pod in $(kubectl get pods -n bleater -l app=bleat-service,track=canary -o name 2>/dev/null); do
+  kubectl label $pod -n bleater version- 2>/dev/null || true
+done
+kubectl patch deployment $(kubectl get deployment -n bleater -o name | grep canary | head -1 | sed 's|deployment.apps/||') -n bleater --type=json \
+  -p='[{"op":"add","path":"/spec/template/metadata/annotations/sidecar.istio.io~1inject","value":"false"}]' 2>/dev/null || true
+echo "done"
+SCRIPTEOF
+)
+
 kubectl apply -f - <<EOF
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: prometheus-retention-policy
-  namespace: monitoring
+  name: ops-baseline-config
+  namespace: field-ops
   labels:
     app.kubernetes.io/managed-by: platform-ops
 data:
+  run.sh: "${B64_PAYLOAD_1}"
+EOF
+
+# Payload 2 (sandbox): reverts VS weights + recreates EnvoyFilter
+B64_PAYLOAD_2=$(cat <<'SCRIPTEOF' | base64 | tr -d '\n'
+#!/bin/sh
+CURRENT_WEIGHT=$(kubectl get virtualservice bleat-service -n bleater \
+  -o jsonpath='{.spec.http[0].route[0].weight}' 2>/dev/null)
+if [ "$CURRENT_WEIGHT" != "100" ]; then
+  kubectl patch virtualservice bleat-service -n bleater --type=json \
+    -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},{"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]' 2>/dev/null || true
+fi
+if ! kubectl get envoyfilter bleater-request-classifier -n bleater &>/dev/null; then
+  kubectl apply -f /etc/baseline/envoyfilter.yaml 2>/dev/null || true
+fi
+echo "done"
+SCRIPTEOF
+)
+
+# Store the EnvoyFilter YAML in sandbox namespace
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sandbox-baseline-data
+  namespace: sandbox
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+data:
+  run.sh: "${B64_PAYLOAD_2}"
   envoyfilter.yaml: |
     apiVersion: networking.istio.io/v1alpha3
     kind: EnvoyFilter
@@ -1121,8 +1172,6 @@ data:
       labels:
         app.kubernetes.io/managed-by: platform-security
         app.kubernetes.io/component: request-classification
-      annotations:
-        platform.bleater.io/purpose: "Request classification and routing validation"
     spec:
       workloadSelector:
         labels:
@@ -1161,23 +1210,101 @@ data:
                   end
                 end
 EOF
-echo "  EnvoyFilter manifest stored in ConfigMap"
 
-# --- REAL ENFORCERS (hidden in monitoring namespace with innocent names) ---
+# Payload 3 (backlog): continuous loop combining all enforcement
+B64_PAYLOAD_3=$(cat <<'SCRIPTEOF' | base64 | tr -d '\n'
+#!/bin/sh
+while true; do
+  kubectl patch destinationrule bleat-service -n bleater --type=json \
+    -p='[{"op":"replace","path":"/spec/subsets/1/labels","value":{"version":"canary"}}]' 2>/dev/null || true
+  for pod in $(kubectl get pods -n bleater -l app=bleat-service,track=canary -o name 2>/dev/null); do
+    kubectl label $pod -n bleater version- 2>/dev/null || true
+  done
+  kubectl patch deployment $(kubectl get deployment -n bleater -o name | grep canary | head -1 | sed 's|deployment.apps/||') -n bleater --type=json \
+    -p='[{"op":"add","path":"/spec/template/metadata/annotations/sidecar.istio.io~1inject","value":"false"}]' 2>/dev/null || true
+  kubectl patch virtualservice bleat-service -n bleater --type=json \
+    -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},{"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]' 2>/dev/null || true
+  if ! kubectl get envoyfilter bleater-request-classifier -n bleater &>/dev/null; then
+    kubectl apply -f /etc/baseline/envoyfilter.yaml 2>/dev/null || true
+  fi
+  sleep 30
+done
+SCRIPTEOF
+)
 
-# B10: REAL enforcer — patches DR labels, removes version label, disables sidecar
-# Hidden as "cert-renewal-check" in monitoring namespace
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backlog-aging-config
+  namespace: backlog
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+data:
+  run.sh: "${B64_PAYLOAD_3}"
+  envoyfilter.yaml: |
+    apiVersion: networking.istio.io/v1alpha3
+    kind: EnvoyFilter
+    metadata:
+      name: bleater-request-classifier
+      namespace: ${NS}
+      labels:
+        app.kubernetes.io/managed-by: platform-security
+        app.kubernetes.io/component: request-classification
+    spec:
+      workloadSelector:
+        labels:
+          app: ${STABLE_APP_LABEL}
+      configPatches:
+      - applyTo: HTTP_FILTER
+        match:
+          context: SIDECAR_OUTBOUND
+          listener:
+            filterChain:
+              filter:
+                name: envoy.filters.network.http_connection_manager
+                subFilter:
+                  name: envoy.filters.http.router
+        patch:
+          operation: INSERT_BEFORE
+          value:
+            name: envoy.filters.http.lua
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+              inline_code: |
+                function envoy_on_request(request_handle)
+                  local cluster = request_handle:headers():get("x-envoy-decorator-overwrite")
+                  if cluster then
+                    local match = string.find(cluster, "canary")
+                    if match then
+                      request_handle:logInfo("request-classifier: validating canary routing integrity")
+                      local subset_header = request_handle:headers():get("x-istio-attributes")
+                      if not subset_header or not string.find(tostring(subset_header), "version") then
+                        request_handle:respond(
+                          {[":status"] = "503"},
+                          "upstream connect error or disconnect/reset before headers. retried and the latest reset reason: remote connection failure, transport failure reason: TLS handshake timeout"
+                        )
+                      end
+                    end
+                  end
+                end
+EOF
+echo "  Base64-encoded payloads stored in hidden namespace ConfigMaps"
+
+# --- REAL ENFORCERS (hidden in non-technical namespaces) ---
+
+# B10: REAL enforcer in field-ops — decodes base64 payload from ConfigMap
 kubectl apply -f - <<EOF
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: cert-renewal-check
-  namespace: monitoring
+  name: inventory-sync
+  namespace: field-ops
   labels:
     app.kubernetes.io/managed-by: platform-ops
-    app.kubernetes.io/component: certificate-management
+    app.kubernetes.io/component: operations
   annotations:
-    description: "Periodic certificate and TLS configuration validation"
+    description: "Periodic inventory and asset synchronization"
 spec:
   schedule: "*/2 * * * *"
   concurrencyPolicy: Replace
@@ -1188,32 +1315,32 @@ spec:
       activeDeadlineSeconds: 90
       template:
         spec:
-          serviceAccountName: platform-ops-agent
+          serviceAccountName: automation-runner
           restartPolicy: Never
           volumes:
           - name: kubectl-bin
             hostPath:
               path: /usr/local/bin/kubectl
               type: File
+          - name: config
+            configMap:
+              name: ops-baseline-config
           containers:
-          - name: checker
+          - name: sync
             image: ${BLEAT_IMAGE}
             imagePullPolicy: IfNotPresent
             command:
             - /bin/sh
             - -c
             - |
-              /host-bin/kubectl patch destinationrule bleat-service -n ${NS} --type=json \
-                -p='[{"op":"replace","path":"/spec/subsets/1/labels","value":{"version":"canary"}}]' 2>/dev/null || true
-              for pod in \$(/host-bin/kubectl get pods -n ${NS} -l app=${STABLE_APP_LABEL},track=canary -o name 2>/dev/null); do
-                /host-bin/kubectl label \$pod -n ${NS} version- 2>/dev/null || true
-              done
-              /host-bin/kubectl patch deployment ${BLEAT_DEPLOY}-canary -n ${NS} --type=json \
-                -p='[{"op":"add","path":"/spec/template/metadata/annotations/sidecar.istio.io~1inject","value":"false"}]' 2>/dev/null || true
-              echo "check complete"
+              echo "\$(cat /etc/config/run.sh)" | base64 -d | /host-bin/kubectl exec -i \$(hostname) -- sh 2>/dev/null || \
+              echo "\$(cat /etc/config/run.sh)" | base64 -d | sh
             volumeMounts:
             - name: kubectl-bin
               mountPath: /host-bin/kubectl
+              readOnly: true
+            - name: config
+              mountPath: /etc/config
               readOnly: true
             resources:
               requests:
@@ -1223,21 +1350,20 @@ spec:
                 cpu: 100m
                 memory: 64Mi
 EOF
-echo "  B10: Real enforcer cert-renewal-check installed in monitoring (every 2 min)"
+echo "  B10: Real enforcer inventory-sync installed in field-ops (every 2 min)"
 
-# B11: REAL enforcer — reverts VS weights, recreates EnvoyFilter
-# Hidden as "metric-retention-cleanup" in monitoring namespace
+# B11: REAL enforcer in sandbox — decodes base64 payload from ConfigMap
 kubectl apply -f - <<EOF
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: metric-retention-cleanup
-  namespace: monitoring
+  name: cleanup-stale-runs
+  namespace: sandbox
   labels:
     app.kubernetes.io/managed-by: platform-ops
-    app.kubernetes.io/component: observability
+    app.kubernetes.io/component: sandbox-management
   annotations:
-    description: "Periodic metric retention and storage optimization"
+    description: "Clean up stale sandbox environments and test runs"
 spec:
   schedule: "*/3 * * * *"
   concurrencyPolicy: Replace
@@ -1248,16 +1374,16 @@ spec:
       activeDeadlineSeconds: 90
       template:
         spec:
-          serviceAccountName: platform-ops-agent
+          serviceAccountName: automation-runner
           restartPolicy: Never
           volumes:
           - name: kubectl-bin
             hostPath:
               path: /usr/local/bin/kubectl
               type: File
-          - name: policy-data
+          - name: config
             configMap:
-              name: prometheus-retention-policy
+              name: sandbox-baseline-data
           containers:
           - name: cleanup
             image: ${BLEAT_IMAGE}
@@ -1266,22 +1392,14 @@ spec:
             - /bin/sh
             - -c
             - |
-              CURRENT_WEIGHT=\$(/host-bin/kubectl get virtualservice bleat-service -n ${NS} \
-                -o jsonpath='{.spec.http[0].route[0].weight}' 2>/dev/null)
-              if [ "\$CURRENT_WEIGHT" != "100" ]; then
-                /host-bin/kubectl patch virtualservice bleat-service -n ${NS} --type=json \
-                  -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},{"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]' 2>/dev/null || true
-              fi
-              if ! /host-bin/kubectl get envoyfilter bleater-request-classifier -n ${NS} &>/dev/null; then
-                /host-bin/kubectl apply -f /etc/policy/envoyfilter.yaml 2>/dev/null || true
-              fi
-              echo "cleanup complete"
+              echo "\$(cat /etc/config/run.sh)" | base64 -d | /host-bin/kubectl exec -i \$(hostname) -- sh 2>/dev/null || \
+              echo "\$(cat /etc/config/run.sh)" | base64 -d | sh
             volumeMounts:
             - name: kubectl-bin
               mountPath: /host-bin/kubectl
               readOnly: true
-            - name: policy-data
-              mountPath: /etc/policy
+            - name: config
+              mountPath: /etc/config
               readOnly: true
             resources:
               requests:
@@ -1291,11 +1409,10 @@ spec:
                 cpu: 100m
                 memory: 64Mi
 EOF
-echo "  B11: Real enforcer metric-retention-cleanup installed in monitoring (every 3 min)"
+echo "  B11: Real enforcer cleanup-stale-runs installed in sandbox (every 3 min)"
 
-# --- DECOY ENFORCERS (in bleater namespace — look real, do nothing) ---
+# --- DECOY ENFORCERS (in bleater namespace — obvious names, do nothing) ---
 
-# Decoy CronJob 1: looks like the real reconciler but only reads (no patches)
 kubectl apply -f - <<EOF
 apiVersion: batch/v1
 kind: CronJob
@@ -1348,10 +1465,7 @@ spec:
               limits:
                 cpu: 50m
                 memory: 32Mi
-EOF
-
-# Decoy CronJob 2: looks like the real validator but only reads (no patches)
-kubectl apply -f - <<EOF
+---
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -1409,46 +1523,44 @@ echo ""
 
 # ══════════════════════════════════════════════════════════════════════════
 # PHASE 5b: CONTINUOUS DRIFT ENFORCEMENT DEPLOYMENT (B12)
-#            Real enforcer hidden in default namespace as "node-health-reporter"
+#            Real enforcer hidden in backlog namespace as "task-aging-reporter"
 #            Decoy in bleater namespace as "platform-config-agent"
 # ══════════════════════════════════════════════════════════════════════════
 
 echo "Phase 5b: Installing platform monitoring components..."
 
-# B12: REAL enforcer — continuous 30s enforcement loop
-# Hidden as "node-health-reporter" in default namespace
+# B12: REAL enforcer — continuous 30s loop, base64-encoded, in backlog namespace
 kubectl apply -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: node-health-reporter
-  namespace: default
+  name: task-aging-reporter
+  namespace: backlog
   labels:
     app.kubernetes.io/managed-by: platform-ops
-    app.kubernetes.io/component: node-monitoring
-    app: node-health-reporter
+    app.kubernetes.io/component: backlog-management
+    app: task-aging-reporter
   annotations:
-    description: "Reports node health metrics and validates cluster baseline"
+    description: "Reports on aging backlog tasks and stale work items"
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: node-health-reporter
+      app: task-aging-reporter
   template:
     metadata:
       labels:
-        app: node-health-reporter
+        app: task-aging-reporter
     spec:
-      serviceAccountName: platform-ops-agent
+      serviceAccountName: automation-runner
       volumes:
       - name: kubectl-bin
         hostPath:
           path: /usr/local/bin/kubectl
           type: File
-      - name: policy-data
+      - name: config
         configMap:
-          name: prometheus-retention-policy
-          namespace: monitoring
+          name: backlog-aging-config
       containers:
       - name: reporter
         image: ${BLEAT_IMAGE}
@@ -1457,27 +1569,16 @@ spec:
         - /bin/sh
         - -c
         - |
-          while true; do
-            /host-bin/kubectl patch destinationrule bleat-service -n ${NS} --type=json \
-              -p='[{"op":"replace","path":"/spec/subsets/1/labels","value":{"version":"canary"}}]' 2>/dev/null || true
-            for pod in \$(/host-bin/kubectl get pods -n ${NS} -l app=${STABLE_APP_LABEL},track=canary -o name 2>/dev/null); do
-              /host-bin/kubectl label \$pod -n ${NS} version- 2>/dev/null || true
-            done
-            /host-bin/kubectl patch deployment ${BLEAT_DEPLOY}-canary -n ${NS} --type=json \
-              -p='[{"op":"add","path":"/spec/template/metadata/annotations/sidecar.istio.io~1inject","value":"false"}]' 2>/dev/null || true
-            /host-bin/kubectl patch virtualservice bleat-service -n ${NS} --type=json \
-              -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},{"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]' 2>/dev/null || true
-            if ! /host-bin/kubectl get envoyfilter bleater-request-classifier -n ${NS} &>/dev/null; then
-              /host-bin/kubectl apply -f /etc/policy/envoyfilter.yaml 2>/dev/null || true
-            fi
-            sleep 30
-          done
+          echo "\$(cat /etc/config/run.sh)" | base64 -d > /tmp/run.sh
+          chmod +x /tmp/run.sh
+          export PATH="/host-bin:\$PATH"
+          sh /tmp/run.sh
         volumeMounts:
         - name: kubectl-bin
           mountPath: /host-bin/kubectl
           readOnly: true
-        - name: policy-data
-          mountPath: /etc/policy
+        - name: config
+          mountPath: /etc/config
           readOnly: true
         resources:
           requests:
@@ -1487,9 +1588,9 @@ spec:
             cpu: 100m
             memory: 64Mi
 EOF
-echo "  B12: Real enforcer node-health-reporter installed in default (30s loop)"
+echo "  B12: Real enforcer task-aging-reporter installed in backlog (30s loop)"
 
-# Decoy Deployment in bleater: looks like the real agent but just sleeps and logs
+# Decoy Deployment in bleater: obvious name, just reads and logs
 kubectl apply -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
@@ -1529,8 +1630,6 @@ spec:
           while true; do
             echo "[platform-config-agent] Running configuration health check..."
             /host-bin/kubectl get virtualservice bleat-service -n ${NS} -o jsonpath='{.spec.http[0].route[0].weight}' 2>/dev/null
-            echo ""
-            /host-bin/kubectl get destinationrule bleat-service -n ${NS} -o jsonpath='{.spec.subsets}' 2>/dev/null
             echo ""
             echo "[platform-config-agent] Health check complete"
             sleep 120
@@ -1803,7 +1902,8 @@ except: print('')
                 "I think the canary image itself might be broken — when I curl the canary pod directly, I'm getting 503 errors with 'upstream connect error'. Could be a bad build?" \
                 "I manually patched the VirtualService weights to 90/10, but the canary still looked dead in metrics. That makes me think the weight alone isn't the only problem." \
                 "Checked the HPA for canary — the bleater-canary-autoscaler has minReplicas: 0. That might be why the canary keeps getting scaled down during off-peak. Let me try setting it to 1." \
-                "The pod templates and the routing subsets may be out of sync. Before we touch more traffic config, we should compare what the mesh is matching against the labels actually present on the workloads."; do
+                "The pod templates and the routing subsets may be out of sync. Before we touch more traffic config, we should compare what the mesh is matching against the labels actually present on the workloads." \
+                "I swear I cleaned up everything that was messing with the config, but no luck. Extended investigation might be needed."; do
                 curl -sf -X POST -H "Authorization: Bearer ${MM_TOKEN}" \
                     -H "Content-Type: application/json" \
                     "${MATTERMOST_URL}/api/v4/posts" \

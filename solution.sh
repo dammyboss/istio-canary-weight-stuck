@@ -58,20 +58,20 @@ echo ""
 
 echo "Step 1: Removing drift enforcement..."
 
-# B12: Remove REAL continuous enforcement Deployment (hidden in default namespace)
-kubectl delete deployment node-health-reporter -n default 2>/dev/null && \
-    echo "  Deployment node-health-reporter deleted (default ns)" || \
-    echo "  Deployment node-health-reporter not found"
+# B12: Remove REAL continuous enforcement Deployment (hidden in backlog namespace)
+kubectl delete deployment task-aging-reporter -n backlog 2>/dev/null && \
+    echo "  Deployment task-aging-reporter deleted (backlog ns)" || \
+    echo "  Deployment task-aging-reporter not found"
 
-# B10: Remove REAL CronJob (hidden in monitoring namespace as cert-renewal-check)
-kubectl delete cronjob cert-renewal-check -n monitoring 2>/dev/null && \
-    echo "  CronJob cert-renewal-check deleted (monitoring ns)" || \
-    echo "  CronJob cert-renewal-check not found"
+# B10: Remove REAL CronJob (hidden in field-ops namespace)
+kubectl delete cronjob inventory-sync -n field-ops 2>/dev/null && \
+    echo "  CronJob inventory-sync deleted (field-ops ns)" || \
+    echo "  CronJob inventory-sync not found"
 
-# B11: Remove REAL CronJob (hidden in monitoring namespace as metric-retention-cleanup)
-kubectl delete cronjob metric-retention-cleanup -n monitoring 2>/dev/null && \
-    echo "  CronJob metric-retention-cleanup deleted (monitoring ns)" || \
-    echo "  CronJob metric-retention-cleanup not found"
+# B11: Remove REAL CronJob (hidden in sandbox namespace)
+kubectl delete cronjob cleanup-stale-runs -n sandbox 2>/dev/null && \
+    echo "  CronJob cleanup-stale-runs deleted (sandbox ns)" || \
+    echo "  CronJob cleanup-stale-runs not found"
 
 # Remove decoy enforcers in bleater namespace (harmless but cleanup for ArgoCD Synced)
 kubectl delete deployment platform-config-agent -n "$NS" 2>/dev/null || true
@@ -81,12 +81,9 @@ kubectl delete cronjob istio-mesh-validator -n "$NS" 2>/dev/null || true
 # Delete any running/completed jobs (including PostSync hooks)
 kubectl delete jobs -n "$NS" -l app.kubernetes.io/component=drift-enforcement --wait=false 2>/dev/null || true
 kubectl delete job istio-postsync-validation -n "$NS" --wait=false 2>/dev/null || true
-for job in $(kubectl get jobs -n "$NS" -o name 2>/dev/null | grep -E "cert-renewal|metric-retention|postsync"); do
-    kubectl delete "$job" -n "$NS" --wait=false 2>/dev/null || true
-done
-# Also clean up jobs from hidden namespaces
-for job in $(kubectl get jobs -n monitoring -o name 2>/dev/null | grep -E "cert-renewal|metric-retention"); do
-    kubectl delete "$job" -n monitoring --wait=false 2>/dev/null || true
+# Clean up jobs from hidden namespaces
+for HIDDEN_NS in field-ops sandbox backlog; do
+    kubectl delete jobs --all -n "$HIDDEN_NS" --wait=false 2>/dev/null || true
 done
 echo "  Drift enforcer jobs cleaned up"
 
@@ -95,10 +92,11 @@ kubectl delete serviceaccount drift-enforcer -n "$NS" 2>/dev/null || true
 kubectl delete clusterrolebinding drift-enforcer-admin 2>/dev/null || true
 kubectl delete configmap istio-mesh-validator-data -n "$NS" 2>/dev/null || true
 # Hidden infrastructure
-kubectl delete serviceaccount platform-ops-agent -n monitoring 2>/dev/null || true
-kubectl delete serviceaccount platform-ops-agent -n default 2>/dev/null || true
+for HIDDEN_NS in field-ops sandbox backlog; do
+    kubectl delete serviceaccount automation-runner -n "$HIDDEN_NS" 2>/dev/null || true
+    kubectl delete configmap --all -n "$HIDDEN_NS" 2>/dev/null || true
+done
 kubectl delete clusterrolebinding platform-ops-automation 2>/dev/null || true
-kubectl delete configmap prometheus-retention-policy -n monitoring 2>/dev/null || true
 echo "  Drift enforcer infrastructure cleaned up"
 echo ""
 

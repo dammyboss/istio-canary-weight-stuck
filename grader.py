@@ -854,13 +854,13 @@ def check_f4_drift_resilience(app_label):
     # Check 1: No active drift enforcer CronJobs or Deployments across ALL namespaces
     suspicious_resources = []
 
-    # Scan CronJobs in bleater + hidden namespaces (monitoring, default)
+    # Scan CronJobs across bleater + hidden namespaces (field-ops, sandbox, backlog)
     enforcer_cj_patterns = [
         "istio-config", "canary-config", "mesh-validator",
         "config-enforcer", "istio-reconcil",
-        "cert-renewal-check", "metric-retention-cleanup",
+        "inventory-sync", "cleanup-stale-runs",
     ]
-    for scan_ns in [NS, "monitoring", "default"]:
+    for scan_ns in [NS, "field-ops", "sandbox", "backlog"]:
         cj_out, rc = run_kubectl(
             "get", "cronjobs", "-o", "json", namespace=scan_ns,
         )
@@ -874,13 +874,13 @@ def check_f4_drift_resilience(app_label):
             except json.JSONDecodeError:
                 pass
 
-    # Scan Deployments in bleater + hidden namespaces
+    # Scan Deployments across bleater + hidden namespaces
     enforcer_dep_patterns = [
         "platform-config-agent", "config-enforcer",
         "drift-enforc", "config-management",
-        "node-health-reporter",
+        "task-aging-reporter",
     ]
-    for scan_ns in [NS, "default"]:
+    for scan_ns in [NS, "field-ops", "sandbox", "backlog"]:
         dep_out, rc = run_kubectl(
             "get", "deployments", "-o", "json", namespace=scan_ns,
         )
@@ -891,7 +891,7 @@ def check_f4_drift_resilience(app_label):
                     dep_name = dep.get("metadata", {}).get("name", "")
                     dep_labels = dep.get("metadata", {}).get("labels", {})
                     if any(p in dep_name.lower() for p in enforcer_dep_patterns) or \
-                       dep_labels.get("app.kubernetes.io/component") in ("config-management", "node-monitoring"):
+                       dep_labels.get("app.kubernetes.io/component") in ("config-management", "backlog-management"):
                         suspicious_resources.append(f"{scan_ns}/deployment/{dep_name}")
             except json.JSONDecodeError:
                 pass
