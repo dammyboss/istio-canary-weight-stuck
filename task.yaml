@@ -25,10 +25,10 @@ prompt: |
   traffic split without leaving behind a fragile manual workaround.
 
   Ensure:
-  - Traffic is correctly split between stable and canary and verifiable via Prometheus metrics
+  - Traffic is restored to a 90/10 stable/canary split and verifiable via Prometheus metrics
   - The service mesh is correctly configured for both stable and canary subsets
-  - All fixes are durable and survive reconciliation or refresh activity
-  - The final state is declarative rather than a temporary imperative patch
+  - All fixes are durable and survive reconciliation or refresh activity from the platform's declarative source of truth
+  - The final state is declarative rather than a temporary imperative patch applied only to the live cluster
   - The canary rollout state is stable and could be progressively shifted to 25%, 50%, 100%
 
   Environment notes:

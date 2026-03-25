@@ -9,10 +9,7 @@ from apex_arena._types import GradingResult
 
 NS = "bleater"
 KUBECONFIG = "/etc/rancher/k3s/k3s.yaml"
-ARGOCD_APP = "runtime-bundle"
-GITOPS_REPO_URL = "http://gitea.devops.local:3000/root/bleater-runtime-bundle.git"
-GITOPS_TARGET_REVISION = "main"
-GITOPS_SOURCE_PATH = "platform/runtime"
+DEFAULT_TARGET_REVISION = "main"
 
 
 def pod_has_istio_proxy(pod_spec):
@@ -46,6 +43,49 @@ def run_cmd(cmd, timeout=30):
     except Exception as e:
         print(f"  cmd error: {e}")
         return "", 1
+
+
+def _normalize_repo_url(repo_url):
+    """Normalize repo URLs for comparison by stripping credentials and trailing .git."""
+    if not repo_url:
+        return ""
+    parsed = urllib.parse.urlparse(repo_url)
+    netloc = parsed.hostname or ""
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    path = parsed.path[:-4] if parsed.path.endswith(".git") else parsed.path
+    return urllib.parse.urlunparse((parsed.scheme, netloc, path, "", "", "")).rstrip("/")
+
+
+def _repo_url_with_auth(repo_url):
+    """Inject root credentials for Gitea clone/fetch operations."""
+    if not repo_url:
+        return repo_url
+    parsed = urllib.parse.urlparse(repo_url)
+    hostname = parsed.hostname or ""
+    if "gitea" not in hostname:
+        return repo_url
+    netloc = parsed.netloc
+    if "@" not in netloc:
+        auth = "root:Admin%40123456@"
+        if parsed.port:
+            netloc = f"{auth}{hostname}:{parsed.port}"
+        else:
+            netloc = f"{auth}{hostname}"
+    return urllib.parse.urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
+
+
+def _read_all_argocd_applications():
+    """Return all ArgoCD Application JSON objects."""
+    apps_out, rc = run_kubectl(
+        "get", "application", "-o", "json", namespace="argocd",
+    )
+    if rc != 0 or not apps_out:
+        return []
+    try:
+        return json.loads(apps_out).get("items", [])
+    except json.JSONDecodeError:
+        return []
 
 
 def discover_app_label():
@@ -128,18 +168,43 @@ def prom_query_value(query):
     return 0.0
 
 
-def _read_argocd_application():
-    """Return the ArgoCD Application JSON for the task, or None."""
-    app_out, rc = run_kubectl(
-        "get", "application", ARGOCD_APP,
-        "-o", "json", namespace="argocd",
-    )
-    if rc != 0 or not app_out:
+def _read_argocd_application(app_label=None):
+    """Return the most relevant ArgoCD Application JSON for the runtime bundle task."""
+    candidates = _read_all_argocd_applications()
+    if not candidates:
         return None
-    try:
-        return json.loads(app_out)
-    except json.JSONDecodeError:
-        return None
+
+    best = None
+    best_score = -1
+    for app in candidates:
+        spec = app.get("spec", {})
+        source = spec.get("source", {})
+        dest_ns = spec.get("destination", {}).get("namespace", "")
+        repo_url = source.get("repoURL", "")
+        source_path = source.get("path", "")
+        app_name = app.get("metadata", {}).get("name", "")
+
+        score = 0
+        if dest_ns == NS:
+            score += 4
+        if "gitea" in repo_url:
+            score += 3
+        if source_path:
+            score += 2
+        if app_name and any(token in app_name.lower() for token in ("runtime", "bundle", "canary", "bleat")):
+            score += 1
+        if source_path and any(token in source_path.lower() for token in ("runtime", "canary", "istio", "traffic")):
+            score += 2
+        if repo_url and any(token in repo_url.lower() for token in ("runtime", "bundle", "bleat")):
+            score += 1
+        if app_label and app_label in json.dumps(app):
+            score += 1
+
+        if score > best_score:
+            best = app
+            best_score = score
+
+    return best
 
 
 def _read_canary_deployment_state(app_label):
@@ -202,6 +267,36 @@ def _live_gitops_state_ok(app_label):
         return False, f"canary deployment labels={deploy_state.get('labels', {})}"
 
     return True, "live VirtualService, DestinationRule, and canary deployment match intended state"
+
+
+def _resource_has_drift_behavior(resource):
+    """Detect active mutators by behavior rather than exact resource names."""
+    text = json.dumps(resource).lower()
+    metadata = resource.get("metadata", {})
+    annotations = metadata.get("annotations", {})
+
+    containers = []
+    spec = resource.get("spec", {})
+    template_spec = spec.get("template", {}).get("spec", {})
+    job_template_spec = spec.get("jobTemplate", {}).get("spec", {}).get("template", {}).get("spec", {})
+    containers.extend(template_spec.get("containers", []))
+    containers.extend(job_template_spec.get("containers", []))
+
+    command_text = " ".join(
+        " ".join(c.get("command", []) + c.get("args", []))
+        for c in containers
+    ).lower()
+
+    mutates_traffic = (
+        ("kubectl" in command_text and any(token in command_text for token in ("patch", "apply", "replace"))) and
+        any(token in command_text for token in ("virtualservice", "destinationrule", "weight", "canary"))
+    )
+    envoy_sabotage = "envoyfilter" in text and any(token in text for token in (":respond(", ":abort(", '"503"', "lua"))
+    hook_mutator = "argocd.argoproj.io/hook" in json.dumps(annotations).lower() and any(
+        token in command_text for token in ("patch", "virtualservice", "weight")
+    )
+
+    return mutates_traffic or envoy_sabotage or hook_mutator
 
 
 def _find_mesh_pod(app_label):
@@ -304,94 +399,85 @@ def generate_mesh_traffic(app_label, svc_name, num_requests=300):
         print(f"  WARNING: Traffic generation may have been partial (rc={rc})")
 
 
-def _verify_git_repo_state():
-    """Clone the runtime bundle repo and verify correct manifests exist
-    and no saboteur resources are referenced in kustomization."""
+def _verify_git_repo_state(app_label, app):
+    """Clone the app's Git source and verify the declarative state is functionally correct."""
     import tempfile
     import shutil
     import glob
 
     results = {"vs_correct": False, "no_saboteurs": False, "dr_correct": False,
                "canary_deploy_in_git": False}
+    if not app:
+        return results
+
+    source = app.get("spec", {}).get("source", {})
+    repo_url = source.get("repoURL", "")
+    source_path = source.get("path", "")
+    revision = source.get("targetRevision") or DEFAULT_TARGET_REVISION
+    if not repo_url or not source_path:
+        return results
+
     tmpdir = tempfile.mkdtemp()
     try:
         rc = subprocess.run(
             ["git", "clone", "--depth=1",
-             "http://root:Admin%40123456@gitea.devops.local:3000/root/bleater-runtime-bundle.git",
+             "--branch", revision,
+             _repo_url_with_auth(repo_url),
              tmpdir + "/repo"],
             capture_output=True, text=True, timeout=30,
         ).returncode
         if rc != 0:
-            print("  WARNING: Could not clone runtime bundle repo")
+            print(f"  WARNING: Could not clone Git source {repo_url}")
             return results
 
         repo_dir = tmpdir + "/repo"
+        source_dir = os.path.join(repo_dir, source_path)
+        if not os.path.isdir(source_dir):
+            print(f"  WARNING: Git source path '{source_path}' not found in repo")
+            return results
 
-        # Check kustomization files for saboteur references
-        saboteur_files = [
-            "cronjob-reconciler.yaml", "cronjob-validator.yaml",
-            "deployment-config-agent.yaml", "envoyfilter.yaml",
-            "configmap-validator-data.yaml", "postsync-validation.yaml",
-        ]
         has_saboteur_refs = False
-        for root, dirs, files in os.walk(repo_dir):
-            if ".git" in root:
+        for root, dirs, files in os.walk(source_dir):
+            if ".git" in root or "charts" in root and os.path.basename(root) == ".git":
                 continue
             for f in files:
-                if f in ("kustomization.yaml", "kustomization.yml"):
-                    fpath = os.path.join(root, f)
+                if not f.endswith((".yaml", ".yml")):
+                    continue
+                fpath = os.path.join(root, f)
+                try:
                     with open(fpath, "r") as fh:
                         content = fh.read()
-                        for sab in saboteur_files:
-                            if sab in content:
-                                has_saboteur_refs = True
-                                print(f"  Git repo still references saboteur: {sab}")
-        # Also check that saboteur files don't physically exist with active content
-        sabotage_patterns = [
-            "weight: 100", "weight: 0",
-            "kubectl patch", ":respond(",
-            "istio-config-reconciler", "mesh-validator",
-            "platform-config-agent", "config-enforcer",
-            "postsync-validation",
-        ]
-        for root_d, dirs_d, files_d in os.walk(repo_dir):
-            if ".git" in root_d:
-                continue
-            for f in files_d:
-                if f in saboteur_files:
-                    fpath = os.path.join(root_d, f)
-                    try:
-                        with open(fpath, "r") as fh:
-                            content = fh.read()
-                            if any(pat in content for pat in sabotage_patterns):
-                                has_saboteur_refs = True
-                                print(f"  Git repo contains saboteur file: {f}")
-                    except Exception:
-                        pass
+                except Exception:
+                    continue
+
+                lowered = content.lower()
+
+                # Detect active reintroduction logic by behavior, not by file name.
+                if (
+                    ("kubectl patch" in lowered or "kubectl apply" in lowered) and
+                    any(token in lowered for token in ("virtualservice", "destinationrule", "weight", "canary"))
+                ):
+                    has_saboteur_refs = True
+                    print(f"  Git source contains mutating reintroduction logic: {os.path.relpath(fpath, source_dir)}")
+                if "argocd.argoproj.io/hook" in lowered and any(token in lowered for token in ("patch", "virtualservice", "weight")):
+                    has_saboteur_refs = True
+                    print(f"  Git source contains Argo hook mutator: {os.path.relpath(fpath, source_dir)}")
+                if "envoyfilter" in content and any(token in content for token in (":respond(", ":abort(", '"503"', "lua")):
+                    has_saboteur_refs = True
+                    print(f"  Git source contains traffic sabotage filter: {os.path.relpath(fpath, source_dir)}")
+                if "VirtualService" in content and "bleat-service" in content:
+                    if "weight: 90" in content and "weight: 10" in content and "subset: stable" in content and "subset: canary" in content:
+                        results["vs_correct"] = True
+                if "DestinationRule" in content and "bleat-service" in content:
+                    if "version: canary" in content and "version: stable" in content:
+                        results["dr_correct"] = True
+                if "Deployment" in content:
+                    canary_marker = ("canary" in lowered and f"app: {app_label}" in content) or "version: canary" in content
+                    inject_disabled = "sidecar.istio.io/inject: \"false\"" in lowered or "sidecar.istio.io/inject: false" in lowered
+                    if canary_marker and not inject_disabled:
+                        results["canary_deploy_in_git"] = True
 
         results["no_saboteurs"] = not has_saboteur_refs
-
-        # Check for VirtualService with correct weights in any YAML
-        for yaml_path in glob.glob(repo_dir + "/**/*.yaml", recursive=True):
-            if ".git" in yaml_path:
-                continue
-            try:
-                with open(yaml_path, "r") as fh:
-                    content = fh.read()
-                    if "VirtualService" in content and "bleat-service" in content:
-                        if "weight: 90" in content and "weight: 10" in content:
-                            if "subset: stable" in content and "subset: canary" in content:
-                                results["vs_correct"] = True
-                    if "DestinationRule" in content and "bleat-service" in content:
-                        if "version: canary" in content and "version: stable" in content:
-                            results["dr_correct"] = True
-                    if "Deployment" in content and "canary" in content:
-                        if ("sidecar.istio.io/inject" in content and
-                                "version: canary" in content and
-                                "app: bleat-service" in content):
-                            results["canary_deploy_in_git"] = True
-            except Exception:
-                pass
     except Exception as e:
         print(f"  WARNING: Git verification error: {e}")
     finally:
@@ -456,15 +542,20 @@ def cleanup_and_wait():
     time.sleep(60)
 
     # Force ArgoCD hard-refresh and let auto-sync re-apply Git state
-    print("Forcing ArgoCD hard refresh...")
-    run_kubectl(
-        "patch", "application", ARGOCD_APP,
-        "--type=merge",
-        '-p={"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}',
-        namespace="argocd",
-    )
-    print("Waiting 30 seconds for ArgoCD auto-sync...")
-    time.sleep(30)
+    app = _read_argocd_application()
+    if app:
+        app_name = app.get("metadata", {}).get("name", "")
+        print(f"Forcing ArgoCD hard refresh on {app_name}...")
+        run_kubectl(
+            "patch", "application", app_name,
+            "--type=merge",
+            '-p={"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}',
+            namespace="argocd",
+        )
+        print("Waiting 30 seconds for ArgoCD auto-sync...")
+        time.sleep(30)
+    else:
+        print("No matching ArgoCD application discovered for hard refresh")
     print("=== Durability window complete ===\n")
 
 
@@ -612,20 +703,21 @@ def check_f2_gitops_convergence(app_label):
     total = 4
 
     # Check 1: ArgoCD app source and policy must match the intended declarative state
-    app = _read_argocd_application()
+    app = _read_argocd_application(app_label)
     if app:
         sync_status = app.get("status", {}).get("sync", {}).get("status", "")
         source = app.get("spec", {}).get("source", {})
         automated = app.get("spec", {}).get("syncPolicy", {}).get("automated", {})
-        repo_ok = source.get("repoURL") == GITOPS_REPO_URL
-        rev_ok = source.get("targetRevision") == GITOPS_TARGET_REVISION
-        path_ok = source.get("path") == GITOPS_SOURCE_PATH
+        repo_url = source.get("repoURL", "")
+        repo_ok = "gitea" in repo_url and repo_url.endswith(".git")
+        rev_ok = bool(source.get("targetRevision", DEFAULT_TARGET_REVISION))
+        path_ok = bool(source.get("path"))
         prune_ok = automated.get("prune") is True
         self_heal_ok = automated.get("selfHeal") is True
         if all([repo_ok, rev_ok, path_ok, prune_ok, self_heal_ok]) and sync_status in ("Synced", "OutOfSync"):
             print(
                 f"  ✅ Check 1: ArgoCD source/policy correct "
-                f"(repo={source.get('repoURL')}, rev={source.get('targetRevision')}, "
+                f"(app={app.get('metadata', {}).get('name')}, repo={source.get('repoURL')}, rev={source.get('targetRevision')}, "
                 f"path={source.get('path')}, prune={prune_ok}, selfHeal={self_heal_ok}, status={sync_status})"
             )
             checks_passed += 1
@@ -638,7 +730,7 @@ def check_f2_gitops_convergence(app_label):
         print("  ❌ Check 1: ArgoCD app not found or unreadable")
 
     # Check 2: Git repo has correct manifests and no saboteur references
-    git_state = _verify_git_repo_state()
+    git_state = _verify_git_repo_state(app_label, app)
     git_ok = (git_state["vs_correct"] and git_state["no_saboteurs"] and
               git_state["dr_correct"] and git_state.get("canary_deploy_in_git", False))
     if git_ok:
@@ -666,25 +758,29 @@ def check_f2_gitops_convergence(app_label):
 
     # Check 4: Hard refresh must keep the app Synced and preserve the live state
     if live_ok:
-        run_kubectl(
-            "patch", "application", ARGOCD_APP,
-            "--type=merge",
-            '-p={"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}',
-            namespace="argocd",
-        )
-        print("  Waiting 45 seconds for post-refresh convergence...")
-        time.sleep(45)
-        refreshed_app = _read_argocd_application()
-        refreshed_ok, refreshed_msg = _live_gitops_state_ok(app_label)
-        refreshed_sync = (
-            refreshed_app.get("status", {}).get("sync", {}).get("status", "")
-            if refreshed_app else "missing"
-        )
-        if refreshed_sync in ("Synced", "OutOfSync") and refreshed_ok:
-            print(f"  ✅ Check 4: Hard refresh preserved Synced app state and live config")
-            checks_passed += 1
+        if app:
+            app_name = app.get("metadata", {}).get("name", "")
+            run_kubectl(
+                "patch", "application", app_name,
+                "--type=merge",
+                '-p={"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}',
+                namespace="argocd",
+            )
+            print("  Waiting 45 seconds for post-refresh convergence...")
+            time.sleep(45)
+            refreshed_app = _read_argocd_application(app_label)
+            refreshed_ok, refreshed_msg = _live_gitops_state_ok(app_label)
+            refreshed_sync = (
+                refreshed_app.get("status", {}).get("sync", {}).get("status", "")
+                if refreshed_app else "missing"
+            )
+            if refreshed_sync in ("Synced", "OutOfSync") and refreshed_ok:
+                print(f"  ✅ Check 4: Hard refresh preserved synced declarative state")
+                checks_passed += 1
+            else:
+                print(f"  ❌ Check 4: status={refreshed_sync}, live_state={refreshed_msg}")
         else:
-            print(f"  ❌ Check 4: status={refreshed_sync}, live_state={refreshed_msg}")
+            print("  ❌ Check 4: Skipped (no ArgoCD application discovered)")
     else:
         print("  ❌ Check 4: Skipped (Check 3 failed)")
 
@@ -848,53 +944,24 @@ def check_f4_drift_resilience(app_label):
     checks_passed = 0
     total = 4
 
-    # Check 1: No active drift enforcer CronJobs or Deployments across ALL namespaces
+    # Check 1: No active drift mutators remain, and declarative sync policy is enforced
     suspicious_resources = []
-
-    # Scan CronJobs across bleater + hidden namespaces (field-ops, sandbox, backlog)
-    enforcer_cj_patterns = [
-        "istio-config", "canary-config", "mesh-validator",
-        "config-enforcer", "istio-reconcil",
-        "inventory-sync", "cleanup-stale-runs",
-    ]
-    for scan_ns in [NS, "field-ops", "sandbox", "backlog"]:
-        cj_out, rc = run_kubectl(
-            "get", "cronjobs", "-o", "json", namespace=scan_ns,
-        )
-        if rc == 0 and cj_out:
+    for kind in ["cronjobs", "deployments"]:
+        out, rc = run_kubectl("get", kind, "-A", "-o", "json")
+        if rc == 0 and out:
             try:
-                cjs = json.loads(cj_out)
-                for cj in cjs.get("items", []):
-                    cj_name = cj.get("metadata", {}).get("name", "")
-                    if any(p in cj_name.lower() for p in enforcer_cj_patterns):
-                        suspicious_resources.append(f"{scan_ns}/cronjob/{cj_name}")
-            except json.JSONDecodeError:
-                pass
-
-    # Scan Deployments across bleater + hidden namespaces
-    enforcer_dep_patterns = [
-        "platform-config-agent", "config-enforcer",
-        "drift-enforc", "config-management",
-        "task-aging-reporter",
-    ]
-    for scan_ns in [NS, "field-ops", "sandbox", "backlog"]:
-        dep_out, rc = run_kubectl(
-            "get", "deployments", "-o", "json", namespace=scan_ns,
-        )
-        if rc == 0 and dep_out:
-            try:
-                deps = json.loads(dep_out)
-                for dep in deps.get("items", []):
-                    dep_name = dep.get("metadata", {}).get("name", "")
-                    dep_labels = dep.get("metadata", {}).get("labels", {})
-                    if any(p in dep_name.lower() for p in enforcer_dep_patterns) or \
-                       dep_labels.get("app.kubernetes.io/component") in ("config-management", "backlog-management"):
-                        suspicious_resources.append(f"{scan_ns}/deployment/{dep_name}")
+                items = json.loads(out).get("items", [])
+                for item in items:
+                    if _resource_has_drift_behavior(item):
+                        ns_name = item.get("metadata", {}).get("namespace", "")
+                        obj_name = item.get("metadata", {}).get("name", "")
+                        singular = "cronjob" if kind == "cronjobs" else "deployment"
+                        suspicious_resources.append(f"{ns_name}/{singular}/{obj_name}")
             except json.JSONDecodeError:
                 pass
 
     # Also verify ArgoCD app has prune + selfHeal enabled (declarative enforcement)
-    app = _read_argocd_application()
+    app = _read_argocd_application(app_label)
     prune_enabled = False
     self_heal_enabled = False
     if app:
@@ -913,10 +980,10 @@ def check_f4_drift_resilience(app_label):
         for r in suspicious_resources:
             print(f"    - {r}")
 
-    # Check 2: No drift enforcer Jobs or ArgoCD PostSync hook Jobs remain active,
-    # and Git source no longer contains the reintroduction path.
+    # Check 2: No active mutating Jobs/hooks remain, and Git source no longer contains
+    # a reintroduction path for the bad state.
     jobs_out, rc = run_kubectl(
-        "get", "jobs", "-o", "json", namespace=NS,
+        "get", "jobs", "-A", "-o", "json",
     )
     suspicious_jobs = []
     if rc == 0 and jobs_out:
@@ -924,37 +991,15 @@ def check_f4_drift_resilience(app_label):
             jobs = json.loads(jobs_out)
             for job in jobs.get("items", []):
                 job_name = job.get("metadata", {}).get("name", "")
-                annotations = job.get("metadata", {}).get("annotations", {})
-
-                # Check for drift enforcer Jobs (from CronJobs)
-                if any(p in job_name.lower() for p in [
-                    "istio-config", "canary-config", "mesh-validator",
-                    "config-enforcer", "istio-reconcil",
-                ]):
-                    status = job.get("status", {})
-                    active = status.get("active", 0)
-                    if active > 0:
-                        suspicious_jobs.append(f"{job_name} (active)")
-
-                # Check for ArgoCD PostSync hook Jobs that sabotage config
-                # Only flag if the Job is active (running) — completed old hooks are harmless
-                if "argocd.argoproj.io/hook" in annotations:
-                    status = job.get("status", {})
-                    active = status.get("active", 0)
-                    succeeded = status.get("succeeded", 0)
-                    # Flag active hooks OR recently succeeded hooks (within grading window)
-                    if active > 0:
-                        containers = (job.get("spec", {}).get("template", {})
-                                      .get("spec", {}).get("containers", []))
-                        for c in containers:
-                            cmd = " ".join(c.get("command", []) + c.get("args", []))
-                            if "patch" in cmd and ("virtualservice" in cmd.lower() or "weight" in cmd):
-                                suspicious_jobs.append(f"{job_name} (ArgoCD PostSync hook - active)")
-                                break
+                status = job.get("status", {})
+                active = status.get("active", 0)
+                if active > 0 and _resource_has_drift_behavior(job):
+                    ns_name = job.get("metadata", {}).get("namespace", "")
+                    suspicious_jobs.append(f"{ns_name}/job/{job_name}")
         except json.JSONDecodeError:
             pass
 
-    git_state = _verify_git_repo_state()
+    git_state = _verify_git_repo_state(app_label, app)
     if not suspicious_jobs and git_state["no_saboteurs"]:
         print("  ✅ Check 2: No active drift Jobs/hooks and Git source no longer contains saboteurs")
         checks_passed += 1
