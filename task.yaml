@@ -3,16 +3,12 @@ prompt: |
   [Context]
   You are a Platform Engineer working on Bleater, a distributed microservices-based social media platform.
   Bleater is deployed on Kubernetes (k3s) in the `bleater` namespace. You can check all available namespaces at `/home/ubuntu/.allowed_namespaces`.
-  Information about the application and supporting infrastructure is available at http://gitea.devops.local/root/bleater-app/wiki.
-  Passwords are stored here: http://passwords.devops.local.
-  Your email is set up at devops@nebula.local and can be accessed via http://maddy.devops.local.
-  For team communication, Mattermost is used at http://mattermost.devops.local.
 
   [Task]
   The platform engineering team recently attempted a manual canary rollout for bleat-service by
   deploying a new bleat-service-canary Deployment alongside the stable version and configuring
-  Istio traffic management to route a small percentage of traffic to the canary as defined in
-  the team's original rollout plan. However, after the rollout was applied, 100% of traffic
+  service-mesh traffic management to route a small percentage of traffic to the canary.
+  However, after the rollout was applied, 100% of traffic
   continues to reach the stable version — the canary is receiving zero requests.
 
   Observed symptoms:
@@ -24,21 +20,21 @@ prompt: |
   - Some manual fixes to traffic routing appear to revert on their own within minutes
   - Engineers have been discussing this incident on the team communication platform
 
-  Your task is to investigate why canary traffic weight is stuck at 0%, identify ALL root
-  causes across the routing configuration, deployment layer, and any automated processes
-  that may be interfering, and restore the correct traffic splitting as originally planned
-  by the team (check Mattermost discussions and Gitea wiki for the intended configuration).
+  Your task is to investigate why canary traffic weight is stuck at 0%, identify the
+  configuration and operational issues blocking the rollout, and restore the intended
+  traffic split without leaving behind a fragile manual workaround.
 
   Ensure:
-  - Traffic is correctly split according to the team's rollout plan and verifiable via Prometheus metrics
-  - The Istio service mesh is properly configured for both stable and canary subsets
-  - All fixes are permanent and managed declaratively — no manual patches that will drift
+  - Traffic is correctly split between stable and canary and verifiable via Prometheus metrics
+  - The service mesh is correctly configured for both stable and canary subsets
+  - All fixes are durable and survive reconciliation or refresh activity
+  - The final state is declarative rather than a temporary imperative patch
   - The canary rollout state is stable and could be progressively shifted to 25%, 50%, 100%
 
   Environment notes:
   - Do NOT use the `-it` flag with `kubectl exec` — use `-i` only or omit flags entirely
-  - The bleat-service deployment uses Istio for traffic management
-  - ArgoCD is used for GitOps-based configuration management
+  - The bleat-service rollout uses service-mesh traffic shaping
+  - More than one automation or controller may be involved in the live state
 
 metadata:
   category: platform-eng

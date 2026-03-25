@@ -2,5 +2,5 @@ FROM us-central1-docker.pkg.dev/bespokelabs/nebula-devops-registry/nebula-devops
 ENV DISPLAY_NUM=1
 ENV COMPUTER_HEIGHT_PX=768
 ENV COMPUTER_WIDTH_PX=1024
-ENV ALLOWED_NAMESPACES="bleater,argocd"
+ENV ALLOWED_NAMESPACES="bleater,argocd,monitoring,default,kube-system"
 ENV ENABLE_ISTIO_BLEATER=true

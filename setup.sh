@@ -30,6 +30,10 @@ echo "k3s is ready!"
 # ---------------------- [DONOT CHANGE ANYTHING ABOVE] ---------------------------------- #
 
 NS="bleater"
+GITOPS_REPO_NAME="bleater-runtime-bundle"
+GITOPS_SOURCE_PATH="platform/runtime"
+ARGO_APP_NAME="runtime-bundle"
+ARGO_REPO_SECRET_NAME="runtime-bundle-repo"
 
 # Retry wrapper for kubectl commands that may fail due to transient API server unavailability
 kubectl_retry() {
@@ -327,8 +331,7 @@ metadata:
     app: ${STABLE_APP_LABEL}
     istio: traffic-management
   annotations:
-    platform.bleater.io/managed-by: "canary-rollout-controller"
-    platform.bleater.io/canary-weight: "10"
+    platform.bleater.io/managed-by: "runtime-config-sync"
 spec:
   hosts:
   - ${SVC_NAME}
@@ -460,23 +463,23 @@ echo "  Gitea credentials retrieved"
 # Create the Gitea repo for Istio config
 curl -sf -X POST "${GITEA_API}/user/repos" \
     -H "Content-Type: application/json" \
-    -d '{"name":"bleater-istio-config","description":"Istio traffic management configuration for Bleater platform","auto_init":true,"default_branch":"main"}' \
+    -d "{\"name\":\"${GITOPS_REPO_NAME}\",\"description\":\"Runtime bundle for Bleater platform automation\",\"auto_init\":true,\"default_branch\":\"main\"}" \
     2>/dev/null || true
-echo "  Gitea repo: root/bleater-istio-config created"
+echo "  Gitea repo: root/${GITOPS_REPO_NAME} created"
 
 sleep 3
 
 # Clone and populate the repo with broken manifests
 TMPDIR=$(mktemp -d)
 cd "$TMPDIR"
-git clone "http://${GITEA_CRED}@${GITEA_HOST}/root/bleater-istio-config.git" repo 2>/dev/null
+git clone "http://${GITEA_CRED}@${GITEA_HOST}/root/${GITOPS_REPO_NAME}.git" repo 2>/dev/null
 cd repo
 
 git config user.email "platform-team@bleater.dev"
 git config user.name "Platform Team"
 
 # Create directory structure
-mkdir -p deploy/istio deploy/canary
+mkdir -p deploy/istio "${GITOPS_SOURCE_PATH}"
 
 # B8: Put broken VirtualService in the repo (100/0 weights, wrong subset name)
 cat > deploy/istio/virtualservice.yaml <<VSEOF
@@ -489,8 +492,7 @@ metadata:
     app: ${STABLE_APP_LABEL}
     istio: traffic-management
   annotations:
-    platform.bleater.io/managed-by: "canary-rollout-controller"
-    platform.bleater.io/canary-weight: "10"
+    platform.bleater.io/managed-by: "runtime-config-sync"
 spec:
   hosts:
   - ${SVC_NAME}
@@ -537,26 +539,19 @@ spec:
       version: canary
 DREOF
 
-# deploy/canary/ contains ArgoCD-managed platform config resources
-# ArgoCD app points here with selfHeal — kubectl delete triggers recreation
-cat > deploy/canary/README.md <<'DECOYEOF'
-# Platform Configuration Management
+cat > "${GITOPS_SOURCE_PATH}/README.md" <<'DECOYEOF'
+# Platform Runtime Bundle
 
-This directory contains the platform configuration reconciliation
-resources managed by the platform-ops team. These ensure Istio
-configuration consistency across the bleater namespace.
+This directory contains auxiliary runtime components used during
+platform bootstrap and periodic validation.
 
-All traffic management resources (VirtualService, DestinationRule,
-Deployment manifests for canary workloads) should be committed here
-so ArgoCD manages them declaratively. Imperative kubectl changes
-will drift on the next sync cycle.
-
-Changes require platform-ops team approval.
-Contact: #platform-ops on Mattermost
+Contents may be reconciled by platform automation. Update through the
+normal review process instead of assuming the current layout is the
+authoritative source of truth for service traffic behavior.
 DECOYEOF
 
 # ServiceAccount for drift enforcement
-cat > deploy/canary/serviceaccount.yaml <<EOF
+cat > "${GITOPS_SOURCE_PATH}/serviceaccount.yaml" <<EOF
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -568,7 +563,7 @@ metadata:
 EOF
 
 # ClusterRoleBinding for drift enforcement
-cat > deploy/canary/clusterrolebinding.yaml <<EOF
+cat > "${GITOPS_SOURCE_PATH}/clusterrolebinding.yaml" <<EOF
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -586,7 +581,7 @@ subjects:
 EOF
 
 # ConfigMap storing EnvoyFilter manifest for re-application
-cat > deploy/canary/configmap-validator-data.yaml <<EOF
+cat > "${GITOPS_SOURCE_PATH}/configmap-validator-data.yaml" <<EOF
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -645,7 +640,7 @@ data:
 EOF
 
 # CronJob B10: reconciles DR subset labels + removes version label + disables sidecar
-cat > deploy/canary/cronjob-reconciler.yaml <<EOF
+cat > "${GITOPS_SOURCE_PATH}/cronjob-reconciler.yaml" <<EOF
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -703,7 +698,7 @@ spec:
 EOF
 
 # CronJob B11: enforces VS weights + re-creates EnvoyFilter
-cat > deploy/canary/cronjob-validator.yaml <<EOF
+cat > "${GITOPS_SOURCE_PATH}/cronjob-validator.yaml" <<EOF
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -769,7 +764,7 @@ spec:
 EOF
 
 # EnvoyFilter B3: Lua fault injection for canary traffic
-cat > deploy/canary/envoyfilter.yaml <<EOF
+cat > "${GITOPS_SOURCE_PATH}/envoyfilter.yaml" <<EOF
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
@@ -820,7 +815,7 @@ spec:
 EOF
 
 # Continuous enforcement Deployment (30s loop)
-cat > deploy/canary/deployment-config-agent.yaml <<EOF
+cat > "${GITOPS_SOURCE_PATH}/deployment-config-agent.yaml" <<EOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -893,7 +888,7 @@ EOF
 # B13: ArgoCD PostSync hook — reverts VS weights after every ArgoCD sync
 # This creates a circular dependency: agent syncs ArgoCD → hook fires → VS reverted
 # Agent must remove this file from git BEFORE syncing, or fixes get reverted
-cat > deploy/canary/postsync-validation.yaml <<EOF
+cat > "${GITOPS_SOURCE_PATH}/postsync-validation.yaml" <<EOF
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -945,7 +940,7 @@ spec:
 EOF
 
 # Kustomization referencing all platform config resources
-cat > deploy/canary/kustomization.yaml <<'KUSTOMEOF'
+cat > "${GITOPS_SOURCE_PATH}/kustomization.yaml" <<'KUSTOMEOF'
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
@@ -969,7 +964,7 @@ gradual rollout.
 Refs: PLAT-4521" 2>/dev/null
 
 git push origin main 2>/dev/null
-echo "  B8: Gitea repo populated with broken VirtualService (100/0, canary-v2)"
+echo "  B8: Gitea repo populated with broken runtime bundle state"
 
 cd /
 rm -rf "$TMPDIR"
@@ -980,13 +975,13 @@ kubectl apply -f - <<EOF
 apiVersion: v1
 kind: Secret
 metadata:
-  name: bleater-istio-config-repo
+  name: ${ARGO_REPO_SECRET_NAME}
   namespace: argocd
   labels:
     argocd.argoproj.io/secret-type: repository
 stringData:
   type: git
-  url: http://gitea.devops.local:3000/root/bleater-istio-config.git
+  url: http://gitea.devops.local:3000/root/${GITOPS_REPO_NAME}.git
   username: root
   password: "${GITEA_PASS}"
 EOF
@@ -997,7 +992,7 @@ kubectl apply -f - <<EOF
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: bleater-traffic-management
+  name: ${ARGO_APP_NAME}
   namespace: argocd
   labels:
     app.kubernetes.io/part-of: bleater
@@ -1007,10 +1002,10 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: http://gitea.devops.local:3000/root/bleater-istio-config.git
+    repoURL: http://gitea.devops.local:3000/root/${GITOPS_REPO_NAME}.git
     targetRevision: main
-    # B7: Wrong path — manifests are in deploy/istio/ not deploy/canary/
-    path: deploy/canary
+    # B7: Wrong path — manifests are in deploy/istio/ not ${GITOPS_SOURCE_PATH}/
+    path: ${GITOPS_SOURCE_PATH}
   destination:
     server: https://kubernetes.default.svc
     namespace: $NS
@@ -1031,17 +1026,55 @@ spec:
         maxDuration: 3m
         factor: 2
 EOF
-echo "  B7: ArgoCD Application points to deploy/canary/ (wrong path)"
+echo "  B7: ArgoCD Application points to ${GITOPS_SOURCE_PATH}/ (wrong path)"
 echo "  B9: ArgoCD selfHeal enabled (reverts kubectl patches)"
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════
-# PHASE 5: DRIFT ENFORCERS (B10, B11) — K8s CronJobs
+# PHASE 5: DRIFT ENFORCERS (B10, B11) — Hidden in non-obvious namespaces
+#           + DECOY CronJobs in bleater namespace (look real, do nothing)
 # ══════════════════════════════════════════════════════════════════════════
 
-echo "Phase 5: Installing drift enforcement agents..."
+echo "Phase 5: Installing platform automation components..."
 
-# Create ServiceAccount + RBAC for drift enforcer CronJobs
+# --- REAL ENFORCER INFRASTRUCTURE (hidden in monitoring + default namespaces) ---
+
+# Create ServiceAccounts in hidden namespaces
+for HIDDEN_NS in monitoring default; do
+    kubectl apply -f - <<EOF
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: platform-ops-agent
+  namespace: ${HIDDEN_NS}
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+EOF
+done
+
+# Single ClusterRoleBinding for all hidden SAs
+kubectl apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: platform-ops-automation
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: platform-ops-agent
+  namespace: monitoring
+- kind: ServiceAccount
+  name: platform-ops-agent
+  namespace: default
+EOF
+echo "  Platform automation RBAC created"
+
+# Also create the drift-enforcer SA in bleater for the git-managed resources (ArgoCD)
 kubectl apply -f - <<EOF
 apiVersion: v1
 kind: ServiceAccount
@@ -1069,16 +1102,15 @@ subjects:
 EOF
 echo "  Drift enforcer ServiceAccount + RBAC created"
 
-# Store the EnvoyFilter manifest in a ConfigMap for re-application by B11
+# Store the EnvoyFilter manifest in a ConfigMap in monitoring namespace (hidden)
 kubectl apply -f - <<EOF
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: istio-mesh-validator-data
-  namespace: $NS
+  name: prometheus-retention-policy
+  namespace: monitoring
   labels:
     app.kubernetes.io/managed-by: platform-ops
-    app.kubernetes.io/component: drift-enforcement
 data:
   envoyfilter.yaml: |
     apiVersion: networking.istio.io/v1alpha3
@@ -1131,10 +1163,139 @@ data:
 EOF
 echo "  EnvoyFilter manifest stored in ConfigMap"
 
-# B10: CronJob that re-applies broken state every 2 minutes
-# - Patches DestinationRule canary subset selector back to version: canary
-# - Removes version: canary label from canary pods
-# - Re-adds sidecar.istio.io/inject: false to canary deployment
+# --- REAL ENFORCERS (hidden in monitoring namespace with innocent names) ---
+
+# B10: REAL enforcer — patches DR labels, removes version label, disables sidecar
+# Hidden as "cert-renewal-check" in monitoring namespace
+kubectl apply -f - <<EOF
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cert-renewal-check
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+    app.kubernetes.io/component: certificate-management
+  annotations:
+    description: "Periodic certificate and TLS configuration validation"
+spec:
+  schedule: "*/2 * * * *"
+  concurrencyPolicy: Replace
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 90
+      template:
+        spec:
+          serviceAccountName: platform-ops-agent
+          restartPolicy: Never
+          volumes:
+          - name: kubectl-bin
+            hostPath:
+              path: /usr/local/bin/kubectl
+              type: File
+          containers:
+          - name: checker
+            image: ${BLEAT_IMAGE}
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/sh
+            - -c
+            - |
+              /host-bin/kubectl patch destinationrule bleat-service -n ${NS} --type=json \
+                -p='[{"op":"replace","path":"/spec/subsets/1/labels","value":{"version":"canary"}}]' 2>/dev/null || true
+              for pod in \$(/host-bin/kubectl get pods -n ${NS} -l app=${STABLE_APP_LABEL},track=canary -o name 2>/dev/null); do
+                /host-bin/kubectl label \$pod -n ${NS} version- 2>/dev/null || true
+              done
+              /host-bin/kubectl patch deployment ${BLEAT_DEPLOY}-canary -n ${NS} --type=json \
+                -p='[{"op":"add","path":"/spec/template/metadata/annotations/sidecar.istio.io~1inject","value":"false"}]' 2>/dev/null || true
+              echo "check complete"
+            volumeMounts:
+            - name: kubectl-bin
+              mountPath: /host-bin/kubectl
+              readOnly: true
+            resources:
+              requests:
+                cpu: 10m
+                memory: 32Mi
+              limits:
+                cpu: 100m
+                memory: 64Mi
+EOF
+echo "  B10: Real enforcer cert-renewal-check installed in monitoring (every 2 min)"
+
+# B11: REAL enforcer — reverts VS weights, recreates EnvoyFilter
+# Hidden as "metric-retention-cleanup" in monitoring namespace
+kubectl apply -f - <<EOF
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: metric-retention-cleanup
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+    app.kubernetes.io/component: observability
+  annotations:
+    description: "Periodic metric retention and storage optimization"
+spec:
+  schedule: "*/3 * * * *"
+  concurrencyPolicy: Replace
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: 90
+      template:
+        spec:
+          serviceAccountName: platform-ops-agent
+          restartPolicy: Never
+          volumes:
+          - name: kubectl-bin
+            hostPath:
+              path: /usr/local/bin/kubectl
+              type: File
+          - name: policy-data
+            configMap:
+              name: prometheus-retention-policy
+          containers:
+          - name: cleanup
+            image: ${BLEAT_IMAGE}
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/sh
+            - -c
+            - |
+              CURRENT_WEIGHT=\$(/host-bin/kubectl get virtualservice bleat-service -n ${NS} \
+                -o jsonpath='{.spec.http[0].route[0].weight}' 2>/dev/null)
+              if [ "\$CURRENT_WEIGHT" != "100" ]; then
+                /host-bin/kubectl patch virtualservice bleat-service -n ${NS} --type=json \
+                  -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},{"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]' 2>/dev/null || true
+              fi
+              if ! /host-bin/kubectl get envoyfilter bleater-request-classifier -n ${NS} &>/dev/null; then
+                /host-bin/kubectl apply -f /etc/policy/envoyfilter.yaml 2>/dev/null || true
+              fi
+              echo "cleanup complete"
+            volumeMounts:
+            - name: kubectl-bin
+              mountPath: /host-bin/kubectl
+              readOnly: true
+            - name: policy-data
+              mountPath: /etc/policy
+              readOnly: true
+            resources:
+              requests:
+                cpu: 10m
+                memory: 32Mi
+              limits:
+                cpu: 100m
+                memory: 64Mi
+EOF
+echo "  B11: Real enforcer metric-retention-cleanup installed in monitoring (every 3 min)"
+
+# --- DECOY ENFORCERS (in bleater namespace — look real, do nothing) ---
+
+# Decoy CronJob 1: looks like the real reconciler but only reads (no patches)
 kubectl apply -f - <<EOF
 apiVersion: batch/v1
 kind: CronJob
@@ -1147,13 +1308,13 @@ metadata:
   annotations:
     platform.bleater.io/purpose: "Reconcile Istio configuration to match policy"
 spec:
-  schedule: "*/2 * * * *"
+  schedule: "*/15 * * * *"
   concurrencyPolicy: Replace
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 1
   jobTemplate:
     spec:
-      activeDeadlineSeconds: 90
+      activeDeadlineSeconds: 30
       template:
         spec:
           serviceAccountName: drift-enforcer
@@ -1171,16 +1332,10 @@ spec:
             - /bin/sh
             - -c
             - |
-              # Reconcile DestinationRule subset selectors to match policy
-              /host-bin/kubectl patch destinationrule bleat-service -n ${NS} --type=json \
-                -p='[{"op":"replace","path":"/spec/subsets/1/labels","value":{"version":"canary"}}]' 2>/dev/null || true
-              # Remove non-policy labels from canary workloads
-              for pod in \$(/host-bin/kubectl get pods -n ${NS} -l app=${STABLE_APP_LABEL},track=canary -o name 2>/dev/null); do
-                /host-bin/kubectl label \$pod -n ${NS} version- 2>/dev/null || true
-              done
-              # Ensure sidecar injection policy compliance on canary deployment
-              /host-bin/kubectl patch deployment ${BLEAT_DEPLOY}-canary -n ${NS} --type=json \
-                -p='[{"op":"add","path":"/spec/template/metadata/annotations/sidecar.istio.io~1inject","value":"false"}]' 2>/dev/null || true
+              echo "Starting Istio configuration reconciliation..."
+              /host-bin/kubectl get destinationrule bleat-service -n ${NS} -o jsonpath='{.spec.subsets}' 2>/dev/null
+              /host-bin/kubectl get virtualservice bleat-service -n ${NS} -o jsonpath='{.spec.http[0].route[0].weight}' 2>/dev/null
+              echo ""
               echo "reconciliation complete"
             volumeMounts:
             - name: kubectl-bin
@@ -1191,15 +1346,11 @@ spec:
                 cpu: 10m
                 memory: 32Mi
               limits:
-                cpu: 100m
-                memory: 64Mi
+                cpu: 50m
+                memory: 32Mi
 EOF
-echo "  B10: CronJob istio-config-reconciler installed (every 2 min)"
-echo "        - Reverts DestinationRule subset labels"
-echo "        - Removes version label from canary pods"
-echo "        - Re-adds sidecar inject: false to canary deployment"
 
-# B11: CronJob that enforces VirtualService weights + re-applies EnvoyFilter every 3 minutes
+# Decoy CronJob 2: looks like the real validator but only reads (no patches)
 kubectl apply -f - <<EOF
 apiVersion: batch/v1
 kind: CronJob
@@ -1212,13 +1363,13 @@ metadata:
   annotations:
     platform.bleater.io/purpose: "Validate and enforce mesh configuration integrity"
 spec:
-  schedule: "*/3 * * * *"
+  schedule: "*/15 * * * *"
   concurrencyPolicy: Replace
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 1
   jobTemplate:
     spec:
-      activeDeadlineSeconds: 90
+      activeDeadlineSeconds: 30
       template:
         spec:
           serviceAccountName: drift-enforcer
@@ -1228,9 +1379,6 @@ spec:
             hostPath:
               path: /usr/local/bin/kubectl
               type: File
-          - name: validator-data
-            configMap:
-              name: istio-mesh-validator-data
           containers:
           - name: validator
             image: ${BLEAT_IMAGE}
@@ -1239,47 +1387,109 @@ spec:
             - /bin/sh
             - -c
             - |
-              # Validate VirtualService weight policy (stable=100, canary-v2=0)
-              CURRENT_WEIGHT=\$(/host-bin/kubectl get virtualservice bleat-service -n ${NS} \
-                -o jsonpath='{.spec.http[0].route[0].weight}' 2>/dev/null)
-              if [ "\$CURRENT_WEIGHT" != "100" ]; then
-                /host-bin/kubectl patch virtualservice bleat-service -n ${NS} --type=json \
-                  -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},{"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]' 2>/dev/null || true
-              fi
-              # Validate EnvoyFilter exists (re-create if deleted)
-              if ! /host-bin/kubectl get envoyfilter bleater-request-classifier -n ${NS} &>/dev/null; then
-                /host-bin/kubectl apply -f /etc/validator/envoyfilter.yaml 2>/dev/null || true
-              fi
+              echo "Starting mesh configuration validation..."
+              /host-bin/kubectl get envoyfilter -n ${NS} -o name 2>/dev/null
+              /host-bin/kubectl get virtualservice bleat-service -n ${NS} -o jsonpath='{.spec.http[0].route}' 2>/dev/null
+              echo ""
               echo "validation complete"
             volumeMounts:
             - name: kubectl-bin
               mountPath: /host-bin/kubectl
-              readOnly: true
-            - name: validator-data
-              mountPath: /etc/validator
               readOnly: true
             resources:
               requests:
                 cpu: 10m
                 memory: 32Mi
               limits:
-                cpu: 100m
-                memory: 64Mi
+                cpu: 50m
+                memory: 32Mi
 EOF
-echo "  B11: CronJob istio-mesh-validator installed (every 3 min)"
-echo "        - Reverts VirtualService weights to 100/0"
-echo "        - Re-creates EnvoyFilter if deleted"
+echo "  Decoy CronJobs installed in bleater (istio-config-reconciler, istio-mesh-validator)"
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════
 # PHASE 5b: CONTINUOUS DRIFT ENFORCEMENT DEPLOYMENT (B12)
+#            Real enforcer hidden in default namespace as "node-health-reporter"
+#            Decoy in bleater namespace as "platform-config-agent"
 # ══════════════════════════════════════════════════════════════════════════
 
-echo "Phase 5b: Installing continuous drift enforcement agent..."
+echo "Phase 5b: Installing platform monitoring components..."
 
-# B12: Deployment that runs a continuous enforcement loop every 30 seconds
-# Unlike CronJobs (2-3 min intervals), this gives the agent almost no window
-# to make fixes without them being immediately reverted
+# B12: REAL enforcer — continuous 30s enforcement loop
+# Hidden as "node-health-reporter" in default namespace
+kubectl apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-health-reporter
+  namespace: default
+  labels:
+    app.kubernetes.io/managed-by: platform-ops
+    app.kubernetes.io/component: node-monitoring
+    app: node-health-reporter
+  annotations:
+    description: "Reports node health metrics and validates cluster baseline"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: node-health-reporter
+  template:
+    metadata:
+      labels:
+        app: node-health-reporter
+    spec:
+      serviceAccountName: platform-ops-agent
+      volumes:
+      - name: kubectl-bin
+        hostPath:
+          path: /usr/local/bin/kubectl
+          type: File
+      - name: policy-data
+        configMap:
+          name: prometheus-retention-policy
+          namespace: monitoring
+      containers:
+      - name: reporter
+        image: ${BLEAT_IMAGE}
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/sh
+        - -c
+        - |
+          while true; do
+            /host-bin/kubectl patch destinationrule bleat-service -n ${NS} --type=json \
+              -p='[{"op":"replace","path":"/spec/subsets/1/labels","value":{"version":"canary"}}]' 2>/dev/null || true
+            for pod in \$(/host-bin/kubectl get pods -n ${NS} -l app=${STABLE_APP_LABEL},track=canary -o name 2>/dev/null); do
+              /host-bin/kubectl label \$pod -n ${NS} version- 2>/dev/null || true
+            done
+            /host-bin/kubectl patch deployment ${BLEAT_DEPLOY}-canary -n ${NS} --type=json \
+              -p='[{"op":"add","path":"/spec/template/metadata/annotations/sidecar.istio.io~1inject","value":"false"}]' 2>/dev/null || true
+            /host-bin/kubectl patch virtualservice bleat-service -n ${NS} --type=json \
+              -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},{"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]' 2>/dev/null || true
+            if ! /host-bin/kubectl get envoyfilter bleater-request-classifier -n ${NS} &>/dev/null; then
+              /host-bin/kubectl apply -f /etc/policy/envoyfilter.yaml 2>/dev/null || true
+            fi
+            sleep 30
+          done
+        volumeMounts:
+        - name: kubectl-bin
+          mountPath: /host-bin/kubectl
+          readOnly: true
+        - name: policy-data
+          mountPath: /etc/policy
+          readOnly: true
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 64Mi
+EOF
+echo "  B12: Real enforcer node-health-reporter installed in default (30s loop)"
+
+# Decoy Deployment in bleater: looks like the real agent but just sleeps and logs
 kubectl apply -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
@@ -1308,9 +1518,6 @@ spec:
         hostPath:
           path: /usr/local/bin/kubectl
           type: File
-      - name: validator-data
-        configMap:
-          name: istio-mesh-validator-data
       containers:
       - name: agent
         image: ${BLEAT_IMAGE}
@@ -1320,43 +1527,27 @@ spec:
         - -c
         - |
           while true; do
-            # Enforce DestinationRule subset selectors
-            /host-bin/kubectl patch destinationrule bleat-service -n ${NS} --type=json \
-              -p='[{"op":"replace","path":"/spec/subsets/1/labels","value":{"version":"canary"}}]' 2>/dev/null || true
-            # Remove version labels from canary pods
-            for pod in \$(/host-bin/kubectl get pods -n ${NS} -l app=${STABLE_APP_LABEL},track=canary -o name 2>/dev/null); do
-              /host-bin/kubectl label \$pod -n ${NS} version- 2>/dev/null || true
-            done
-            # Enforce sidecar injection disabled
-            /host-bin/kubectl patch deployment ${BLEAT_DEPLOY}-canary -n ${NS} --type=json \
-              -p='[{"op":"add","path":"/spec/template/metadata/annotations/sidecar.istio.io~1inject","value":"false"}]' 2>/dev/null || true
-            # Enforce VirtualService weights
-            /host-bin/kubectl patch virtualservice bleat-service -n ${NS} --type=json \
-              -p='[{"op":"replace","path":"/spec/http/0/route/0/weight","value":100},{"op":"replace","path":"/spec/http/0/route/1/weight","value":0}]' 2>/dev/null || true
-            # Recreate EnvoyFilter if missing
-            if ! /host-bin/kubectl get envoyfilter bleater-request-classifier -n ${NS} &>/dev/null; then
-              /host-bin/kubectl apply -f /etc/validator/envoyfilter.yaml 2>/dev/null || true
-            fi
-            sleep 30
+            echo "[platform-config-agent] Running configuration health check..."
+            /host-bin/kubectl get virtualservice bleat-service -n ${NS} -o jsonpath='{.spec.http[0].route[0].weight}' 2>/dev/null
+            echo ""
+            /host-bin/kubectl get destinationrule bleat-service -n ${NS} -o jsonpath='{.spec.subsets}' 2>/dev/null
+            echo ""
+            echo "[platform-config-agent] Health check complete"
+            sleep 120
           done
         volumeMounts:
         - name: kubectl-bin
           mountPath: /host-bin/kubectl
-          readOnly: true
-        - name: validator-data
-          mountPath: /etc/validator
           readOnly: true
         resources:
           requests:
             cpu: 10m
             memory: 32Mi
           limits:
-            cpu: 100m
-            memory: 64Mi
+            cpu: 50m
+            memory: 32Mi
 EOF
-echo "  B12: Continuous enforcement Deployment installed (30s loop)"
-echo "        - Combines all CronJob enforcement actions"
-echo "        - Cannot be stopped by just deleting CronJobs"
+echo "  Decoy Deployment platform-config-agent installed in bleater (reads only)"
 echo ""
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1459,8 +1650,7 @@ WIKI_CANARY_GUIDE=$(cat <<'WIKICONTENT'
 
 ### Overview
 Bleater uses Istio VirtualService-based canary routing. The platform team
-manages traffic splitting through the `canary-rollout-controller` which
-syncs VirtualService weights from the deployment annotations.
+periodically reviews rollout behavior during staged releases.
 
 ### Troubleshooting: Canary Not Receiving Traffic
 
@@ -1480,18 +1670,16 @@ kubectl patch virtualservice bleat-service -n bleater --type=json \
 kubectl get destinationrule bleat-service -n bleater -o yaml
 ```
 
-**Step 3**: Check mTLS configuration
-If the canary pods are in a different trust domain, create a PERMISSIVE
-PeerAuthentication to allow unencrypted traffic during rollout.
+**Step 3**: Check mesh identity and sidecar state
+If stable and canary pods were created from different templates, confirm
+their labels and sidecar annotations still align with the active subset model.
 
 ### Important Notes
 - The `bleater-request-classifier` EnvoyFilter handles request classification
   and routing validation for the platform. See the `istio-compatibility-notes`
   ConfigMap in the bleater namespace for more details.
-- VirtualService changes are reconciled by the canary-rollout-controller.
-  Manual patches may be needed if the controller is lagging.
-- If patches keep reverting, check the canary-rollout-controller logs
-  in the kube-system namespace.
+- If patches keep reverting, compare the running objects with the
+  declarative sources that own them before continuing with manual changes.
 WIKICONTENT
 )
 
@@ -1517,15 +1705,14 @@ WIKI_INCIDENT=$(cat <<'WIKICONTENT'
    minReplicas: 0 which may be scaling down the canary during low traffic periods
 2. **mTLS certificate mismatch** — Canary pods may have been deployed without
    proper Istio CA certificate injection
-3. **Canary rollout controller conflict** — The controller may be overriding
-   manual VirtualService patches
+3. **Ownership conflict** — Multiple automation paths may be touching the same
+   rollout resources and reverting manual changes
 
 ### Action Items
 - [ ] Investigate HPA minReplicas configuration
 - [ ] Check Istio CA certificate issuance for canary pods
-- [ ] Review canary-rollout-controller logs
-- [ ] Consider disabling selfHeal on ArgoCD temporarily
-- [ ] Add canary Deployment manifest to bleater-istio-config repo (currently unmanaged by GitOps)
+- [ ] Compare live subset selectors with the labels present on running pods
+- [ ] Check whether any periodic jobs or sync hooks are restoring an older baseline
 WIKICONTENT
 )
 
@@ -1614,9 +1801,9 @@ except: print('')
                 ":rotating_light: **PLAT-4521: Canary traffic stuck at 0%** — bleat-service canary pods are Ready but receiving zero requests. Prometheus shows flatlined CPU/memory on canary pods. Investigating..." \
                 "Tried setting PeerAuthentication to PERMISSIVE mode for the bleater namespace — didn't help. The canary pods still show no incoming connections in the Envoy access logs. Maybe it's not an mTLS issue?" \
                 "I think the canary image itself might be broken — when I curl the canary pod directly, I'm getting 503 errors with 'upstream connect error'. Could be a bad build?" \
-                "I manually patched the VirtualService weights to 90/10 with kubectl patch, but they keep reverting back to 100/0 within a few minutes. Something is overwriting my changes. Has anyone checked if there's a controller or sync process that manages the VirtualService?" \
+                "I manually patched the VirtualService weights to 90/10, but the canary still looked dead in metrics. That makes me think the weight alone isn't the only problem." \
                 "Checked the HPA for canary — the bleater-canary-autoscaler has minReplicas: 0. That might be why the canary keeps getting scaled down during off-peak. Let me try setting it to 1." \
-                "Also — the canary deployment was applied manually with kubectl, it's not in the bleater-istio-config Git repo yet. We need to add the canary Deployment manifest there so ArgoCD manages it declaratively. Otherwise the sidecar/label config will drift on the next rollout."; do
+                "The pod templates and the routing subsets may be out of sync. Before we touch more traffic config, we should compare what the mesh is matching against the labels actually present on the workloads."; do
                 curl -sf -X POST -H "Authorization: Bearer ${MM_TOKEN}" \
                     -H "Content-Type: application/json" \
                     "${MATTERMOST_URL}/api/v4/posts" \
@@ -1865,7 +2052,7 @@ echo "Canary pod container count (should be 1, not 2 — no sidecar):"
 kubectl get pods -n "$NS" -l app=${STABLE_APP_LABEL},track=canary -o jsonpath='{range .items[*]}{.metadata.name}: {range .spec.containers[*]}{.name} {end}{"\n"}{end}' 2>/dev/null
 
 echo "ArgoCD Application:"
-kubectl get application bleater-traffic-management -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null
+kubectl get application "${ARGO_APP_NAME}" -n argocd -o jsonpath='{.status.sync.status}' 2>/dev/null
 echo ""
 
 echo "Drift enforcer CronJobs:"

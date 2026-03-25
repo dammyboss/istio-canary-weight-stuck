@@ -4,6 +4,10 @@ set -e
 
 export KUBECONFIG=/home/ubuntu/.kube/config
 NS="bleater"
+GITOPS_REPO_NAME="bleater-runtime-bundle"
+GITOPS_SOURCE_PATH="platform/runtime"
+ARGO_APP_NAME="runtime-bundle"
+ARGO_REPO_SECRET_NAME="runtime-bundle-repo"
 
 echo "=== Fixing Istio Canary Weight Stuck ==="
 echo ""
@@ -41,8 +45,8 @@ echo ""
 echo "Step 0: Disabling ArgoCD automated sync..."
 
 # The sabotaging resources (CronJobs, EnvoyFilter, Deployment) are ArgoCD-managed
-# via deploy/canary/ with selfHeal: true. Must disable auto-sync before deleting them.
-kubectl patch application bleater-traffic-management -n argocd --type=json \
+# via the runtime bundle source path with selfHeal: true. Must disable auto-sync before deleting them.
+kubectl patch application "${ARGO_APP_NAME}" -n argocd --type=json \
     -p='[{"op":"remove","path":"/spec/syncPolicy/automated"}]' \
     2>/dev/null && echo "  ArgoCD automated sync disabled" || \
     echo "  ArgoCD sync policy already manual"
@@ -54,35 +58,47 @@ echo ""
 
 echo "Step 1: Removing drift enforcement..."
 
-# B12: Remove continuous enforcement Deployment
-kubectl delete deployment platform-config-agent -n "$NS" 2>/dev/null && \
-    echo "  Deployment platform-config-agent deleted" || \
-    echo "  Deployment platform-config-agent not found"
+# B12: Remove REAL continuous enforcement Deployment (hidden in default namespace)
+kubectl delete deployment node-health-reporter -n default 2>/dev/null && \
+    echo "  Deployment node-health-reporter deleted (default ns)" || \
+    echo "  Deployment node-health-reporter not found"
 
-# B10: Remove CronJob istio-config-reconciler
-kubectl delete cronjob istio-config-reconciler -n "$NS" 2>/dev/null && \
-    echo "  CronJob istio-config-reconciler deleted" || \
-    echo "  CronJob istio-config-reconciler not found"
+# B10: Remove REAL CronJob (hidden in monitoring namespace as cert-renewal-check)
+kubectl delete cronjob cert-renewal-check -n monitoring 2>/dev/null && \
+    echo "  CronJob cert-renewal-check deleted (monitoring ns)" || \
+    echo "  CronJob cert-renewal-check not found"
 
-# B11: Remove CronJob istio-mesh-validator
-kubectl delete cronjob istio-mesh-validator -n "$NS" 2>/dev/null && \
-    echo "  CronJob istio-mesh-validator deleted" || \
-    echo "  CronJob istio-mesh-validator not found"
+# B11: Remove REAL CronJob (hidden in monitoring namespace as metric-retention-cleanup)
+kubectl delete cronjob metric-retention-cleanup -n monitoring 2>/dev/null && \
+    echo "  CronJob metric-retention-cleanup deleted (monitoring ns)" || \
+    echo "  CronJob metric-retention-cleanup not found"
+
+# Remove decoy enforcers in bleater namespace (harmless but cleanup for ArgoCD Synced)
+kubectl delete deployment platform-config-agent -n "$NS" 2>/dev/null || true
+kubectl delete cronjob istio-config-reconciler -n "$NS" 2>/dev/null || true
+kubectl delete cronjob istio-mesh-validator -n "$NS" 2>/dev/null || true
 
 # Delete any running/completed jobs (including PostSync hooks)
 kubectl delete jobs -n "$NS" -l app.kubernetes.io/component=drift-enforcement --wait=false 2>/dev/null || true
-# Also delete PostSync hook job and CronJob jobs by name
 kubectl delete job istio-postsync-validation -n "$NS" --wait=false 2>/dev/null || true
-for job in $(kubectl get jobs -n "$NS" -o name 2>/dev/null | grep -E "istio-config-reconciler|istio-mesh-validator|postsync"); do
+for job in $(kubectl get jobs -n "$NS" -o name 2>/dev/null | grep -E "cert-renewal|metric-retention|postsync"); do
     kubectl delete "$job" -n "$NS" --wait=false 2>/dev/null || true
+done
+# Also clean up jobs from hidden namespaces
+for job in $(kubectl get jobs -n monitoring -o name 2>/dev/null | grep -E "cert-renewal|metric-retention"); do
+    kubectl delete "$job" -n monitoring --wait=false 2>/dev/null || true
 done
 echo "  Drift enforcer jobs cleaned up"
 
-# Clean up remaining drift enforcer infrastructure (SA, RBAC, ConfigMap)
-# These are leftovers from deploy/canary/ that ArgoCD needs pruned for Synced status
+# Clean up drift enforcer infrastructure
 kubectl delete serviceaccount drift-enforcer -n "$NS" 2>/dev/null || true
 kubectl delete clusterrolebinding drift-enforcer-admin 2>/dev/null || true
 kubectl delete configmap istio-mesh-validator-data -n "$NS" 2>/dev/null || true
+# Hidden infrastructure
+kubectl delete serviceaccount platform-ops-agent -n monitoring 2>/dev/null || true
+kubectl delete serviceaccount platform-ops-agent -n default 2>/dev/null || true
+kubectl delete clusterrolebinding platform-ops-automation 2>/dev/null || true
+kubectl delete configmap prometheus-retention-policy -n monitoring 2>/dev/null || true
 echo "  Drift enforcer infrastructure cleaned up"
 echo ""
 
@@ -234,7 +250,7 @@ GITEA_CRED="root:${GITEA_PASS_ENC}"
 # Clone and fix the Gitea repo
 TMPDIR=$(mktemp -d)
 cd "$TMPDIR"
-git clone "http://${GITEA_CRED}@${GITEA_HOST}/root/bleater-istio-config.git" repo 2>/dev/null
+git clone "http://${GITEA_CRED}@${GITEA_HOST}/root/${GITOPS_REPO_NAME}.git" repo 2>/dev/null
 cd repo
 
 git config user.email "platform-team@bleater.dev"
@@ -292,20 +308,20 @@ spec:
       version: canary
 DREOF
 
-# Replace deploy/canary/ sabotaging resources with correct VS/DR
-# Keep the ArgoCD path as deploy/canary/ (no path change needed)
-rm -f deploy/canary/cronjob-reconciler.yaml deploy/canary/cronjob-validator.yaml \
-      deploy/canary/envoyfilter.yaml deploy/canary/deployment-config-agent.yaml \
-      deploy/canary/configmap-validator-data.yaml deploy/canary/serviceaccount.yaml \
-      deploy/canary/clusterrolebinding.yaml deploy/canary/postsync-validation.yaml \
-      deploy/canary/README.md 2>/dev/null || true
+# Replace runtime bundle sabotaging resources with correct VS/DR
+rm -f "${GITOPS_SOURCE_PATH}/cronjob-reconciler.yaml" "${GITOPS_SOURCE_PATH}/cronjob-validator.yaml" \
+      "${GITOPS_SOURCE_PATH}/envoyfilter.yaml" "${GITOPS_SOURCE_PATH}/deployment-config-agent.yaml" \
+      "${GITOPS_SOURCE_PATH}/configmap-validator-data.yaml" "${GITOPS_SOURCE_PATH}/serviceaccount.yaml" \
+      "${GITOPS_SOURCE_PATH}/clusterrolebinding.yaml" "${GITOPS_SOURCE_PATH}/postsync-validation.yaml" \
+      "${GITOPS_SOURCE_PATH}/README.md" 2>/dev/null || true
 
-# Put correct VS/DR directly in deploy/canary/ (ArgoCD syncs from here)
-cp deploy/istio/virtualservice.yaml deploy/canary/virtualservice.yaml
-cp deploy/istio/destinationrule.yaml deploy/canary/destinationrule.yaml
+# Put correct VS/DR directly in the active GitOps source path
+mkdir -p "${GITOPS_SOURCE_PATH}"
+cp deploy/istio/virtualservice.yaml "${GITOPS_SOURCE_PATH}/virtualservice.yaml"
+cp deploy/istio/destinationrule.yaml "${GITOPS_SOURCE_PATH}/destinationrule.yaml"
 
 # Add canary Deployment manifest to Git (declarative management)
-cat > deploy/canary/deployment-canary.yaml <<CANDEPEOF
+cat > "${GITOPS_SOURCE_PATH}/deployment-canary.yaml" <<CANDEPEOF
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -352,10 +368,10 @@ spec:
             cpu: 200m
             memory: 256Mi
 CANDEPEOF
-echo "  deploy/canary/deployment-canary.yaml created (declarative canary management)"
+echo "  ${GITOPS_SOURCE_PATH}/deployment-canary.yaml created (declarative canary management)"
 
 # Update kustomization to reference VS, DR, and canary Deployment
-cat > deploy/canary/kustomization.yaml <<'KUSEOF'
+cat > "${GITOPS_SOURCE_PATH}/kustomization.yaml" <<'KUSEOF'
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
@@ -363,7 +379,7 @@ resources:
 - destinationrule.yaml
 - deployment-canary.yaml
 KUSEOF
-echo "  deploy/canary/ fixed: sabotaging resources replaced with correct VS/DR + canary deployment"
+echo "  ${GITOPS_SOURCE_PATH}/ fixed: sabotaging resources replaced with correct VS/DR + canary deployment"
 
 git add -A
 git commit -m "fix: correct canary traffic management and declarative deployment
@@ -372,7 +388,7 @@ git commit -m "fix: correct canary traffic management and declarative deployment
 - Fix subset name from canary-v2 to canary
 - Align DestinationRule subset selectors with pod labels
 - Add canary Deployment manifest (sidecar injection, version label)
-- Remove drift enforcement resources from deploy/canary/
+- Remove drift enforcement resources from the active runtime bundle source path
 
 Fixes: PLAT-4521" 2>/dev/null
 
@@ -388,23 +404,27 @@ kubectl apply -f - <<REPOSECEOF
 apiVersion: v1
 kind: Secret
 metadata:
-  name: bleater-istio-config-repo
+  name: ${ARGO_REPO_SECRET_NAME}
   namespace: argocd
   labels:
     argocd.argoproj.io/secret-type: repository
 stringData:
   type: git
-  url: http://gitea.devops.local:3000/root/bleater-istio-config.git
+  url: http://gitea.devops.local:3000/root/${GITOPS_REPO_NAME}.git
   username: root
   password: "${GITEA_PASS}"
 REPOSECEOF
 echo "  ArgoCD repo credentials configured"
 
-# Re-enable ArgoCD automated sync with selfHeal + prune
-# Keep path as deploy/canary/ (we replaced sabotaging resources with correct VS/DR there)
-kubectl patch application bleater-traffic-management -n argocd --type=merge \
+# Re-enable ArgoCD automated sync with selfHeal + prune and restate the intended source
+kubectl patch application "${ARGO_APP_NAME}" -n argocd --type=merge \
     -p='{
         "spec": {
+            "source": {
+                "repoURL": "http://gitea.devops.local:3000/root/'"${GITOPS_REPO_NAME}"'.git",
+                "targetRevision": "main",
+                "path": "'"${GITOPS_SOURCE_PATH}"'"
+            },
             "syncPolicy": {
                 "automated": {
                     "selfHeal": true,
@@ -416,7 +436,7 @@ kubectl patch application bleater-traffic-management -n argocd --type=merge \
     2>/dev/null && echo "  ArgoCD auto-sync re-enabled with prune" || true
 
 # Trigger an ArgoCD sync
-kubectl patch application bleater-traffic-management -n argocd --type=merge \
+kubectl patch application "${ARGO_APP_NAME}" -n argocd --type=merge \
     -p='{"operation":{"initiatedBy":{"username":"solution"},"sync":{"revision":"HEAD","prune":true}}}' \
     2>/dev/null || true
 echo "  ArgoCD sync triggered (with prune)"
@@ -425,7 +445,7 @@ echo "  ArgoCD sync triggered (with prune)"
 echo "  Waiting for ArgoCD sync..."
 ELAPSED=0
 while [ $ELAPSED -lt 120 ]; do
-    SYNC_STATUS=$(kubectl get application bleater-traffic-management -n argocd \
+    SYNC_STATUS=$(kubectl get application "${ARGO_APP_NAME}" -n argocd \
         -o jsonpath='{.status.sync.status}' 2>/dev/null)
     if [ "$SYNC_STATUS" = "Synced" ]; then
         echo "  ArgoCD sync complete: $SYNC_STATUS"
@@ -534,7 +554,7 @@ kubectl get pods -n "$NS" -l version=stable -o wide 2>/dev/null
 
 echo ""
 echo "ArgoCD Application status:"
-kubectl get application bleater-traffic-management -n argocd -o jsonpath='  sync: {.status.sync.status}, health: {.status.health.status}' 2>/dev/null
+kubectl get application "${ARGO_APP_NAME}" -n argocd -o jsonpath='  sync: {.status.sync.status}, health: {.status.health.status}' 2>/dev/null
 echo ""
 
 echo ""

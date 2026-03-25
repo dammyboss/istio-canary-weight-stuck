@@ -9,6 +9,10 @@ from apex_arena._types import GradingResult
 
 NS = "bleater"
 KUBECONFIG = "/etc/rancher/k3s/k3s.yaml"
+ARGOCD_APP = "runtime-bundle"
+GITOPS_REPO_URL = "http://gitea.devops.local:3000/root/bleater-runtime-bundle.git"
+GITOPS_TARGET_REVISION = "main"
+GITOPS_SOURCE_PATH = "platform/runtime"
 
 
 def pod_has_istio_proxy(pod_spec):
@@ -124,6 +128,80 @@ def prom_query_value(query):
     return 0.0
 
 
+def _read_argocd_application():
+    """Return the ArgoCD Application JSON for the task, or None."""
+    app_out, rc = run_kubectl(
+        "get", "application", ARGOCD_APP,
+        "-o", "json", namespace="argocd",
+    )
+    if rc != 0 or not app_out:
+        return None
+    try:
+        return json.loads(app_out)
+    except json.JSONDecodeError:
+        return None
+
+
+def _read_canary_deployment_state(app_label):
+    """Return key canary deployment state used by GitOps and durability checks."""
+    dep_name = None
+    dep_out, rc = run_kubectl(
+        "get", "deployment", "-l", f"app={app_label}",
+        "-o", "json", namespace=NS,
+    )
+    if rc != 0 or not dep_out:
+        return None
+    try:
+        items = json.loads(dep_out).get("items", [])
+    except json.JSONDecodeError:
+        return None
+
+    for item in items:
+        name = item.get("metadata", {}).get("name", "")
+        if "canary" in name:
+            dep_name = name
+            annotations = item.get("spec", {}).get("template", {}).get("metadata", {}).get("annotations", {})
+            labels = item.get("spec", {}).get("template", {}).get("metadata", {}).get("labels", {})
+            return {
+                "name": dep_name,
+                "sidecar_inject": annotations.get("sidecar.istio.io/inject"),
+                "labels": labels,
+            }
+    return None
+
+
+def _selectors_match_gitops_intent(app_label):
+    """Check that DestinationRule selectors match the intended versioned workloads."""
+    canary_selector, stable_selector = _read_dr_subset_selectors(app_label)
+    return (
+        stable_selector == {"version": "stable"} and
+        canary_selector == {"version": "canary"}
+    )
+
+
+def _live_gitops_state_ok(app_label):
+    """Check live VS/DR/deployment state matches the intended declarative outcome."""
+    vs_weights = _read_vs_weights(app_label)
+    deploy_state = _read_canary_deployment_state(app_label)
+    if not deploy_state:
+        return False, "canary deployment not found"
+
+    if not (vs_weights and vs_weights.get("stable") == 90 and vs_weights.get("canary") == 10):
+        return False, f"live VirtualService weights={vs_weights}"
+
+    if not _selectors_match_gitops_intent(app_label):
+        canary_selector, stable_selector = _read_dr_subset_selectors(app_label)
+        return False, f"live DestinationRule selectors stable={stable_selector}, canary={canary_selector}"
+
+    if deploy_state.get("sidecar_inject") != "true":
+        return False, f"canary sidecar annotation={deploy_state.get('sidecar_inject')}"
+
+    if deploy_state.get("labels", {}).get("version") != "canary":
+        return False, f"canary deployment labels={deploy_state.get('labels', {})}"
+
+    return True, "live VirtualService, DestinationRule, and canary deployment match intended state"
+
+
 def _find_mesh_pod(app_label):
     """Find a running pod with istio-proxy sidecar for exec.
 
@@ -225,7 +303,7 @@ def generate_mesh_traffic(app_label, svc_name, num_requests=300):
 
 
 def _verify_git_repo_state():
-    """Clone the bleater-istio-config repo and verify correct manifests exist
+    """Clone the runtime bundle repo and verify correct manifests exist
     and no saboteur resources are referenced in kustomization."""
     import tempfile
     import shutil
@@ -237,12 +315,12 @@ def _verify_git_repo_state():
     try:
         rc = subprocess.run(
             ["git", "clone", "--depth=1",
-             "http://root:Admin%40123456@gitea.devops.local:3000/root/bleater-istio-config.git",
+             "http://root:Admin%40123456@gitea.devops.local:3000/root/bleater-runtime-bundle.git",
              tmpdir + "/repo"],
             capture_output=True, text=True, timeout=30,
         ).returncode
         if rc != 0:
-            print("  WARNING: Could not clone bleater-istio-config repo")
+            print("  WARNING: Could not clone runtime bundle repo")
             return results
 
         repo_dir = tmpdir + "/repo"
@@ -381,7 +459,7 @@ def cleanup_and_wait():
     print("Forcing ArgoCD hard refresh to verify declarative state...")
     for cycle in range(3):
         run_kubectl(
-            "patch", "application", "bleater-traffic-management",
+            "patch", "application", ARGOCD_APP,
             "--type=merge",
             '-p={"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}',
             namespace="argocd",
@@ -527,44 +605,40 @@ def check_f2_gitops_convergence(app_label):
     Requires: Gitea repo fixed, ArgoCD app path fixed, drift enforcers removed from git.
 
     4 checks:
-    1. ArgoCD Application shows Synced status
-    2. Git repo has correct VS/DR and no saboteur references in kustomization
-    3. VirtualService has correct weights (90/10) and subset names (stable/canary)
-    4. VirtualService unchanged after 120s wait (no drift/revert)
+    1. ArgoCD Application source and sync policy match the intended declarative state
+    2. Git repo has correct VS/DR/canary deployment and no saboteur references
+    3. Live VirtualService, DestinationRule, and canary deployment match the intended state
+    4. State survives a hard refresh and remains Synced
     """
     print("\n--- F2: GitOps Convergence ---")
     checks_passed = 0
     total = 4
 
-    # Check 1: ArgoCD app exists and has automated sync enabled
-    # We accept Synced or OutOfSync (metadata drift from kubectl apply is normal)
-    # The real declarative check is Check 2 (git repo verification)
-    app_out, rc = run_kubectl(
-        "get", "application", "bleater-traffic-management",
-        "-o", "json", namespace="argocd",
-    )
-    argocd_ok = False
-    if rc == 0 and app_out:
-        try:
-            app = json.loads(app_out)
-            sync_status = app.get("status", {}).get("sync", {}).get("status", "")
-            sync_policy = app.get("spec", {}).get("syncPolicy", {})
-            has_auto_sync = "automated" in sync_policy
-            source_path = app.get("spec", {}).get("source", {}).get("path", "")
-
-            # Pass if: app exists, has automated sync, and is not in Error state
-            if sync_status in ("Synced", "OutOfSync") and has_auto_sync:
-                argocd_ok = True
-                print(f"  ✅ Check 1: ArgoCD app exists, auto-sync enabled, "
-                      f"status={sync_status}, path={source_path}")
-                checks_passed += 1
-            else:
-                print(f"  ❌ Check 1: ArgoCD app status={sync_status}, "
-                      f"auto-sync={'enabled' if has_auto_sync else 'disabled'}")
-        except json.JSONDecodeError:
-            print(f"  ❌ Check 1: Could not parse ArgoCD app JSON")
+    # Check 1: ArgoCD app source and policy must match the intended declarative state
+    app = _read_argocd_application()
+    if app:
+        sync_status = app.get("status", {}).get("sync", {}).get("status", "")
+        source = app.get("spec", {}).get("source", {})
+        automated = app.get("spec", {}).get("syncPolicy", {}).get("automated", {})
+        repo_ok = source.get("repoURL") == GITOPS_REPO_URL
+        rev_ok = source.get("targetRevision") == GITOPS_TARGET_REVISION
+        path_ok = source.get("path") == GITOPS_SOURCE_PATH
+        prune_ok = automated.get("prune") is True
+        self_heal_ok = automated.get("selfHeal") is True
+        if all([repo_ok, rev_ok, path_ok, prune_ok, self_heal_ok]) and sync_status == "Synced":
+            print(
+                f"  ✅ Check 1: ArgoCD source/policy correct "
+                f"(repo={source.get('repoURL')}, rev={source.get('targetRevision')}, "
+                f"path={source.get('path')}, prune={prune_ok}, selfHeal={self_heal_ok}, status={sync_status})"
+            )
+            checks_passed += 1
+        else:
+            print(
+                f"  ❌ Check 1: repo_ok={repo_ok}, rev_ok={rev_ok}, path_ok={path_ok}, "
+                f"prune={prune_ok}, selfHeal={self_heal_ok}, status={sync_status}"
+            )
     else:
-        print(f"  ❌ Check 1: ArgoCD app not found or unreachable")
+        print("  ❌ Check 1: ArgoCD app not found or unreadable")
 
     # Check 2: Git repo has correct manifests and no saboteur references
     git_state = _verify_git_repo_state()
@@ -585,29 +659,37 @@ def check_f2_gitops_convergence(app_label):
             details.append("canary Deployment with sidecar injection + version label not in Git")
         print(f"  ❌ Check 2: Git repo issues: {'; '.join(details)}")
 
-    # Check 3: VirtualService weights correct
-    vs_correct = False
-    vs_weights = _read_vs_weights(app_label)
-    if vs_weights and vs_weights.get("stable") == 90 and vs_weights.get("canary") == 10:
-        vs_correct = True
-        print(f"  ✅ Check 3: VirtualService weights = stable:90, canary:10")
+    # Check 3: Live state must match the intended GitOps outcome
+    live_ok, live_msg = _live_gitops_state_ok(app_label)
+    if live_ok:
+        print(f"  ✅ Check 3: {live_msg}")
         checks_passed += 1
     else:
-        print(f"  ❌ Check 3: VirtualService weights = {vs_weights} "
-              f"(expected stable:90, canary:10)")
+        print(f"  ❌ Check 3: {live_msg}")
 
-    # Check 4: VirtualService stability — wait 120s and re-read
-    if vs_correct:
-        print(f"  Waiting 120 seconds for VirtualService stability check...")
-        time.sleep(120)
-        vs_weights2 = _read_vs_weights(app_label)
-        if vs_weights2 and vs_weights2.get("stable") == 90 and vs_weights2.get("canary") == 10:
-            print(f"  ✅ Check 4: VirtualService stable after 120s (no drift)")
+    # Check 4: Hard refresh must keep the app Synced and preserve the live state
+    if live_ok:
+        run_kubectl(
+            "patch", "application", ARGOCD_APP,
+            "--type=merge",
+            '-p={"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}',
+            namespace="argocd",
+        )
+        print("  Waiting 90 seconds for post-refresh convergence...")
+        time.sleep(90)
+        refreshed_app = _read_argocd_application()
+        refreshed_ok, refreshed_msg = _live_gitops_state_ok(app_label)
+        refreshed_sync = (
+            refreshed_app.get("status", {}).get("sync", {}).get("status", "")
+            if refreshed_app else "missing"
+        )
+        if refreshed_sync == "Synced" and refreshed_ok:
+            print(f"  ✅ Check 4: Hard refresh preserved Synced app state and live config")
             checks_passed += 1
         else:
-            print(f"  ❌ Check 4: VirtualService drifted to {vs_weights2} after 120s")
+            print(f"  ❌ Check 4: status={refreshed_sync}, live_state={refreshed_msg}")
     else:
-        print(f"  ❌ Check 4: Skipped (Check 3 failed)")
+        print("  ❌ Check 4: Skipped (Check 3 failed)")
 
     score = round(checks_passed / total, 2)
     print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F2 ({checks_passed}/{total})")
@@ -760,68 +842,68 @@ def check_f4_drift_resilience(app_label):
     Runs AFTER the 90s durability wait in cleanup_and_wait().
 
     4 checks:
-    1. No active drift enforcer CronJobs in bleater namespace
-    2. No running/pending drift enforcer Jobs in bleater namespace
-    3. VirtualService still has correct 90/10 weights (not reverted)
-    4. Canary pods still have version: canary label + istio-proxy sidecar
+    1. No active drift actor remains and the declarative sync policy is fully enforced
+    2. Git source no longer contains an active reintroduction path for the sabotaged state
+    3. Live VirtualService, DestinationRule, and canary deployment still match the intended state
+    4. Canary traffic and observability still work after the durability window
     """
     print("\n--- F4: Drift Resilience ---")
     checks_passed = 0
     total = 4
 
-    # Check 1: No drift enforcer CronJobs or Deployments
+    # Check 1: No active drift enforcer CronJobs or Deployments across ALL namespaces
     suspicious_resources = []
 
-    # Check CronJobs
-    cj_out, rc = run_kubectl(
-        "get", "cronjobs", "-o", "json", namespace=NS,
-    )
-    if rc == 0 and cj_out:
-        try:
-            cjs = json.loads(cj_out)
-            for cj in cjs.get("items", []):
-                cj_name = cj.get("metadata", {}).get("name", "")
-                if any(p in cj_name.lower() for p in [
-                    "istio-config", "canary-config", "mesh-validator",
-                    "config-enforcer", "istio-reconcil",
-                ]):
-                    suspicious_resources.append(f"cronjob/{cj_name}")
-        except json.JSONDecodeError:
-            pass
+    # Scan CronJobs in bleater + hidden namespaces (monitoring, default)
+    enforcer_cj_patterns = [
+        "istio-config", "canary-config", "mesh-validator",
+        "config-enforcer", "istio-reconcil",
+        "cert-renewal-check", "metric-retention-cleanup",
+    ]
+    for scan_ns in [NS, "monitoring", "default"]:
+        cj_out, rc = run_kubectl(
+            "get", "cronjobs", "-o", "json", namespace=scan_ns,
+        )
+        if rc == 0 and cj_out:
+            try:
+                cjs = json.loads(cj_out)
+                for cj in cjs.get("items", []):
+                    cj_name = cj.get("metadata", {}).get("name", "")
+                    if any(p in cj_name.lower() for p in enforcer_cj_patterns):
+                        suspicious_resources.append(f"{scan_ns}/cronjob/{cj_name}")
+            except json.JSONDecodeError:
+                pass
 
-    # Check Deployments for continuous enforcement agents
-    dep_out, rc = run_kubectl(
-        "get", "deployments", "-o", "json", namespace=NS,
-    )
-    if rc == 0 and dep_out:
-        try:
-            deps = json.loads(dep_out)
-            for dep in deps.get("items", []):
-                dep_name = dep.get("metadata", {}).get("name", "")
-                dep_labels = dep.get("metadata", {}).get("labels", {})
-                if any(p in dep_name.lower() for p in [
-                    "platform-config-agent", "config-enforcer",
-                    "drift-enforc", "config-management",
-                ]) or dep_labels.get("app.kubernetes.io/component") == "config-management":
-                    suspicious_resources.append(f"deployment/{dep_name}")
-        except json.JSONDecodeError:
-            pass
+    # Scan Deployments in bleater + hidden namespaces
+    enforcer_dep_patterns = [
+        "platform-config-agent", "config-enforcer",
+        "drift-enforc", "config-management",
+        "node-health-reporter",
+    ]
+    for scan_ns in [NS, "default"]:
+        dep_out, rc = run_kubectl(
+            "get", "deployments", "-o", "json", namespace=scan_ns,
+        )
+        if rc == 0 and dep_out:
+            try:
+                deps = json.loads(dep_out)
+                for dep in deps.get("items", []):
+                    dep_name = dep.get("metadata", {}).get("name", "")
+                    dep_labels = dep.get("metadata", {}).get("labels", {})
+                    if any(p in dep_name.lower() for p in enforcer_dep_patterns) or \
+                       dep_labels.get("app.kubernetes.io/component") in ("config-management", "node-monitoring"):
+                        suspicious_resources.append(f"{scan_ns}/deployment/{dep_name}")
+            except json.JSONDecodeError:
+                pass
 
     # Also verify ArgoCD app has prune + selfHeal enabled (declarative enforcement)
-    app_out, rc = run_kubectl(
-        "get", "application", "bleater-traffic-management",
-        "-o", "json", namespace="argocd",
-    )
+    app = _read_argocd_application()
     prune_enabled = False
     self_heal_enabled = False
-    if rc == 0 and app_out:
-        try:
-            app = json.loads(app_out)
-            automated = app.get("spec", {}).get("syncPolicy", {}).get("automated", {})
-            prune_enabled = automated.get("prune", False)
-            self_heal_enabled = automated.get("selfHeal", False)
-        except json.JSONDecodeError:
-            pass
+    if app:
+        automated = app.get("spec", {}).get("syncPolicy", {}).get("automated", {})
+        prune_enabled = automated.get("prune", False)
+        self_heal_enabled = automated.get("selfHeal", False)
 
     if not suspicious_resources and prune_enabled and self_heal_enabled:
         print(f"  ✅ Check 1: No drift enforcers, ArgoCD prune+selfHeal enabled")
@@ -834,7 +916,8 @@ def check_f4_drift_resilience(app_label):
         for r in suspicious_resources:
             print(f"    - {r}")
 
-    # Check 2: No drift enforcer Jobs or ArgoCD PostSync hook Jobs
+    # Check 2: No drift enforcer Jobs or ArgoCD PostSync hook Jobs remain active,
+    # and Git source no longer contains the reintroduction path.
     jobs_out, rc = run_kubectl(
         "get", "jobs", "-o", "json", namespace=NS,
     )
@@ -874,42 +957,52 @@ def check_f4_drift_resilience(app_label):
         except json.JSONDecodeError:
             pass
 
-    if not suspicious_jobs:
-        print(f"  ✅ Check 2: No drift enforcer Jobs or PostSync hooks found")
+    git_state = _verify_git_repo_state()
+    if not suspicious_jobs and git_state["no_saboteurs"]:
+        print("  ✅ Check 2: No active drift Jobs/hooks and Git source no longer contains saboteurs")
         checks_passed += 1
     else:
-        print(f"  ❌ Check 2: Drift enforcer Jobs found:")
-        for j in suspicious_jobs:
-            print(f"    - job/{j}")
+        if suspicious_jobs:
+            print("  ❌ Check 2: Drift enforcer Jobs found:")
+            for j in suspicious_jobs:
+                print(f"    - job/{j}")
+        else:
+            print("  ❌ Check 2: Git source still contains saboteur references")
 
-    # Check 3: VirtualService still correct after drift window
-    vs_weights = _read_vs_weights(app_label)
-    if vs_weights and vs_weights.get("stable") == 90 and vs_weights.get("canary") == 10:
-        print(f"  ✅ Check 3: VirtualService weights still 90/10 after drift window")
+    # Check 3: Live state still matches intended declarative outcome after drift window
+    live_ok, live_msg = _live_gitops_state_ok(app_label)
+    if live_ok:
+        print(f"  ✅ Check 3: {live_msg}")
         checks_passed += 1
     else:
-        print(f"  ❌ Check 3: VirtualService weights = {vs_weights}")
+        print(f"  ❌ Check 3: {live_msg}")
 
-    # Check 4: Canary pods still have version label + sidecar
-    pods_out, rc = run_kubectl(
-        "get", "pods", "-l", f"app={app_label},version=canary",
-        "-o", "json", namespace=NS,
-    )
-    labeled_with_sidecar = 0
-    if rc == 0 and pods_out:
-        try:
-            pods = json.loads(pods_out)
-            for pod in pods.get("items", []):
-                if pod_has_istio_proxy(pod.get("spec", {})):
-                    labeled_with_sidecar += 1
-        except json.JSONDecodeError:
-            pass
-
-    if labeled_with_sidecar >= 1:
-        print(f"  ✅ Check 4: {labeled_with_sidecar} canary pod(s) with version label + sidecar intact")
+    # Check 4: Canary traffic remains observable after the durability window
+    svc_name = discover_svc_name(app_label)
+    generate_mesh_traffic(app_label, svc_name, num_requests=120)
+    print("  Waiting 20s for Prometheus scrape cycle...")
+    time.sleep(20)
+    canary_rate = 0.0
+    stable_labels = False
+    for query in [
+        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code=~"2..",reporter="destination"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",response_code=~"2.."}}[5m]))',
+    ]:
+        canary_rate = prom_query_value(query)
+        if canary_rate > 0:
+            break
+    for query in [
+        f'count(istio_requests_total{{destination_service_name="{svc_name}",destination_version="stable"}})',
+        f'count(istio_requests_total{{destination_app="{app_label}",destination_version="stable"}})',
+    ]:
+        if prom_query_value(query) > 0:
+            stable_labels = True
+            break
+    if canary_rate > 0 and stable_labels:
+        print(f"  ✅ Check 4: Canary traffic still observable after durability window ({canary_rate:.4f} req/s)")
         checks_passed += 1
     else:
-        print(f"  ❌ Check 4: No canary pods with version: canary label and istio-proxy sidecar")
+        print(f"  ❌ Check 4: post-durability observability incomplete (canary_rate={canary_rate:.4f}, stable_labels={stable_labels})")
 
     score = round(checks_passed / total, 2)
     print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F4 ({checks_passed}/{total})")
