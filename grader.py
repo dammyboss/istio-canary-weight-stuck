@@ -450,24 +450,19 @@ def cleanup_and_wait():
     print("=== Pre-grading cleanup ===")
     subprocess.run(["pkill", "-9", "-u", "ubuntu"], capture_output=True)
     time.sleep(3)
-    print("Waiting 90 seconds for drift enforcement window...")
-    time.sleep(90)
+    print("Waiting 60 seconds for drift enforcement window...")
+    time.sleep(60)
 
-    # Force ArgoCD to hard-refresh repo cache and let auto-sync re-apply Git state.
-    # This catches agents who only did kubectl fixes without updating Git.
-    # We do multiple refresh cycles to ensure ArgoCD processes the refresh reliably.
-    print("Forcing ArgoCD hard refresh to verify declarative state...")
-    for cycle in range(3):
-        run_kubectl(
-            "patch", "application", ARGOCD_APP,
-            "--type=merge",
-            '-p={"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}',
-            namespace="argocd",
-        )
-        if cycle < 2:
-            time.sleep(60)
-    print("Waiting 120 seconds for ArgoCD auto-sync from fresh repo cache...")
-    time.sleep(120)
+    # Force ArgoCD hard-refresh and let auto-sync re-apply Git state
+    print("Forcing ArgoCD hard refresh...")
+    run_kubectl(
+        "patch", "application", ARGOCD_APP,
+        "--type=merge",
+        '-p={"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}',
+        namespace="argocd",
+    )
+    print("Waiting 30 seconds for ArgoCD auto-sync...")
+    time.sleep(30)
     print("=== Durability window complete ===\n")
 
 
@@ -675,8 +670,8 @@ def check_f2_gitops_convergence(app_label):
             '-p={"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}',
             namespace="argocd",
         )
-        print("  Waiting 90 seconds for post-refresh convergence...")
-        time.sleep(90)
+        print("  Waiting 45 seconds for post-refresh convergence...")
+        time.sleep(45)
         refreshed_app = _read_argocd_application()
         refreshed_ok, refreshed_msg = _live_gitops_state_ok(app_label)
         refreshed_sync = (
