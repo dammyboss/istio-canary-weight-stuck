@@ -509,8 +509,8 @@ def check_f1_canary_traffic_observability(app_label, svc_name):
         print(f"  ❌ Check 4: destination_version labels not found in Prometheus "
               f"(canary={version_labels_exist}, stable={stable_labels_exist})")
 
-    score = 1.0 if checks_passed == total else 0.0
-    print(f"{'✅ PASSED' if score == 1.0 else '❌ FAILED'} F1 ({checks_passed}/{total})")
+    score = round(checks_passed / total, 2)
+    print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F1 ({checks_passed}/{total})")
     return score
 
 
@@ -609,8 +609,8 @@ def check_f2_gitops_convergence(app_label):
     else:
         print(f"  ❌ Check 4: Skipped (Check 3 failed)")
 
-    score = 1.0 if checks_passed == total else 0.0
-    print(f"{'✅ PASSED' if score == 1.0 else '❌ FAILED'} F2 ({checks_passed}/{total})")
+    score = round(checks_passed / total, 2)
+    print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F2 ({checks_passed}/{total})")
     return score
 
 
@@ -743,8 +743,8 @@ def check_f3_service_mesh_integrity(app_label):
     else:
         print(f"  ❌ Check 4: Could not find stable subset in DestinationRule")
 
-    score = 1.0 if checks_passed == total else 0.0
-    print(f"{'✅ PASSED' if score == 1.0 else '❌ FAILED'} F3 ({checks_passed}/{total})")
+    score = round(checks_passed / total, 2)
+    print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F3 ({checks_passed}/{total})")
     return score
 
 
@@ -911,8 +911,8 @@ def check_f4_drift_resilience(app_label):
     else:
         print(f"  ❌ Check 4: No canary pods with version: canary label and istio-proxy sidecar")
 
-    score = 1.0 if checks_passed == total else 0.0
-    print(f"{'✅ PASSED' if score == 1.0 else '❌ FAILED'} F4 ({checks_passed}/{total})")
+    score = round(checks_passed / total, 2)
+    print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F4 ({checks_passed}/{total})")
     return score
 
 
@@ -986,8 +986,8 @@ def grade(transcript: str) -> GradingResult:
     feedback_lines = []
     for key, (code, desc) in labels.items():
         s = subscores.get(key, 0)
-        icon = "✅" if s >= 1.0 else "❌"
-        feedback_lines.append(f"{icon} {code}: {desc}")
+        icon = "✅" if s >= 1.0 else "⚠️" if s > 0 else "❌"
+        feedback_lines.append(f"{icon} {code}: {desc} [{s:.0%}]")
 
     print(f"\n=== Final Score: {round(total_score, 3)} ===")
     for line in feedback_lines:
