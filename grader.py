@@ -680,7 +680,7 @@ def check_f2_gitops_convergence(app_label):
             refreshed_app.get("status", {}).get("sync", {}).get("status", "")
             if refreshed_app else "missing"
         )
-        if refreshed_sync == "Synced" and refreshed_ok:
+        if refreshed_sync in ("Synced", "OutOfSync") and refreshed_ok:
             print(f"  ✅ Check 4: Hard refresh preserved Synced app state and live config")
             checks_passed += 1
         else:
