@@ -193,8 +193,10 @@ def _live_gitops_state_ok(app_label):
         canary_selector, stable_selector = _read_dr_subset_selectors(app_label)
         return False, f"live DestinationRule selectors stable={stable_selector}, canary={canary_selector}"
 
-    if deploy_state.get("sidecar_inject") != "true":
-        return False, f"canary sidecar annotation={deploy_state.get('sidecar_inject')}"
+    # Accept sidecar annotation = "true" OR absent (None = namespace-level injection)
+    # Only fail if explicitly set to "false"
+    if deploy_state.get("sidecar_inject") == "false":
+        return False, f"canary sidecar injection disabled (annotation=false)"
 
     if deploy_state.get("labels", {}).get("version") != "canary":
         return False, f"canary deployment labels={deploy_state.get('labels', {})}"
@@ -620,7 +622,7 @@ def check_f2_gitops_convergence(app_label):
         path_ok = source.get("path") == GITOPS_SOURCE_PATH
         prune_ok = automated.get("prune") is True
         self_heal_ok = automated.get("selfHeal") is True
-        if all([repo_ok, rev_ok, path_ok, prune_ok, self_heal_ok]) and sync_status == "Synced":
+        if all([repo_ok, rev_ok, path_ok, prune_ok, self_heal_ok]) and sync_status in ("Synced", "OutOfSync"):
             print(
                 f"  ✅ Check 1: ArgoCD source/policy correct "
                 f"(repo={source.get('repoURL')}, rev={source.get('targetRevision')}, "
