@@ -235,12 +235,54 @@ def _read_canary_deployment_state(app_label):
     return None
 
 
+def _selector_matches_role(selector, role):
+    """Accept either version-based or track-based stable/canary identity."""
+    if not selector:
+        return False
+    expected = selector.get("version") or selector.get("track")
+    return expected == role
+
+
+def _deployment_matches_canary_role(labels):
+    """Accept either version=canary or track=canary on the canary deployment."""
+    if not labels:
+        return False
+    return labels.get("version") == "canary" or labels.get("track") == "canary"
+
+
+def _get_role_pods(app_label, role):
+    """Return pods for a stable/canary role using either version or track labels."""
+    selectors = [
+        f"app={app_label},version={role}",
+        f"app={app_label},track={role}",
+    ]
+    pods = []
+    seen = set()
+    for selector in selectors:
+        pods_out, rc = run_kubectl(
+            "get", "pods", "-l", selector,
+            "-o", "json", namespace=NS,
+        )
+        if rc != 0 or not pods_out:
+            continue
+        try:
+            items = json.loads(pods_out).get("items", [])
+        except json.JSONDecodeError:
+            continue
+        for pod in items:
+            name = pod.get("metadata", {}).get("name")
+            if name and name not in seen:
+                seen.add(name)
+                pods.append(pod)
+    return pods
+
+
 def _selectors_match_gitops_intent(app_label):
-    """Check that DestinationRule selectors match the intended versioned workloads."""
+    """Check that DestinationRule selectors match the intended stable/canary workloads."""
     canary_selector, stable_selector = _read_dr_subset_selectors(app_label)
     return (
-        stable_selector == {"version": "stable"} and
-        canary_selector == {"version": "canary"}
+        _selector_matches_role(stable_selector, "stable") and
+        _selector_matches_role(canary_selector, "canary")
     )
 
 
@@ -263,7 +305,7 @@ def _live_gitops_state_ok(app_label):
     if deploy_state.get("sidecar_inject") == "false":
         return False, f"canary sidecar injection disabled (annotation=false)"
 
-    if deploy_state.get("labels", {}).get("version") != "canary":
+    if not _deployment_matches_canary_role(deploy_state.get("labels", {})):
         return False, f"canary deployment labels={deploy_state.get('labels', {})}"
 
     return True, "live VirtualService, DestinationRule, and canary deployment match intended state"
@@ -340,7 +382,7 @@ def _find_mesh_pod(app_label):
                         pass
 
     # Fallback to bleat-service pods
-    for label_set in [f"app={app_label},version=stable", f"app={app_label}"]:
+    for label_set in [f"app={app_label},version=stable", f"app={app_label},track=stable", f"app={app_label}"]:
         pods_out, rc = run_kubectl(
             "get", "pods", "-l", label_set,
             "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}",
@@ -469,10 +511,17 @@ def _verify_git_repo_state(app_label, app):
                     if "weight: 90" in content and "weight: 10" in content and "subset: stable" in content and "subset: canary" in content:
                         results["vs_correct"] = True
                 if "DestinationRule" in content and "bleat-service" in content:
-                    if "version: canary" in content and "version: stable" in content:
+                    if (
+                        ("version: canary" in content and "version: stable" in content) or
+                        ("track: canary" in content and "track: stable" in content)
+                    ):
                         results["dr_correct"] = True
                 if "Deployment" in content:
-                    canary_marker = ("canary" in lowered and f"app: {app_label}" in content) or "version: canary" in content
+                    canary_marker = (
+                        ("canary" in lowered and f"app: {app_label}" in content) or
+                        "version: canary" in content or
+                        "track: canary" in content
+                    )
                     inject_disabled = "sidecar.istio.io/inject: \"false\"" in lowered or "sidecar.istio.io/inject: false" in lowered
                     if canary_marker and not inject_disabled:
                         results["canary_deploy_in_git"] = True
@@ -574,7 +623,7 @@ def check_f1_canary_traffic_observability(app_label, svc_name):
     Combines traffic routing verification with Prometheus metrics validation.
 
     4 checks:
-    1. Canary pods exist with version: canary label AND istio-proxy sidecar
+    1. Canary pods exist with stable/canary identity labels AND istio-proxy sidecar
     2. VirtualService has correct 90/10 weights with correct subset names
     3. Canary HTTP 200 response rate > 0 in Prometheus (traffic flows + succeeds)
     4. destination_version label propagation (both canary + stable in Prometheus)
@@ -584,25 +633,16 @@ def check_f1_canary_traffic_observability(app_label, svc_name):
     total = 4
 
     # Check 1: Canary pods exist with correct labels AND sidecar
-    canary_pods_out, rc = run_kubectl(
-        "get", "pods", "-l", f"app={app_label},version=canary",
-        "-o", "json", namespace=NS,
-    )
     canary_with_sidecar = 0
     canary_pods_ready = 0
-    if rc == 0 and canary_pods_out:
-        try:
-            pods = json.loads(canary_pods_out)
-            for pod in pods.get("items", []):
-                has_sidecar = pod_has_istio_proxy(pod.get("spec", {}))
-                statuses = pod.get("status", {}).get("containerStatuses", [])
-                all_ready = all(s.get("ready", False) for s in statuses) if statuses else False
-                if all_ready:
-                    canary_pods_ready += 1
-                if has_sidecar and all_ready:
-                    canary_with_sidecar += 1
-        except json.JSONDecodeError:
-            pass
+    for pod in _get_role_pods(app_label, "canary"):
+        has_sidecar = pod_has_istio_proxy(pod.get("spec", {}))
+        statuses = pod.get("status", {}).get("containerStatuses", [])
+        all_ready = all(s.get("ready", False) for s in statuses) if statuses else False
+        if all_ready:
+            canary_pods_ready += 1
+        if has_sidecar and all_ready:
+            canary_with_sidecar += 1
 
     if canary_with_sidecar >= 1:
         print(f"  ✅ Check 1: {canary_with_sidecar} canary pod(s) with sidecar and Ready")
@@ -745,7 +785,7 @@ def check_f2_gitops_convergence(app_label):
         if not git_state["dr_correct"]:
             details.append("DR subsets incorrect in Git")
         if not git_state.get("canary_deploy_in_git", False):
-            details.append("canary Deployment with sidecar injection + version label not in Git")
+            details.append("canary Deployment with sidecar injection + stable/canary identity labels not in Git")
         print(f"  ❌ Check 2: Git repo issues: {'; '.join(details)}")
 
     # Check 3: Live state must match the intended GitOps outcome
@@ -800,33 +840,23 @@ def check_f3_service_mesh_integrity(app_label):
     Verifies Istio sidecar injection, EnvoyFilter cleanup, and DestinationRule
     subset endpoint matching.
 
-    4 checks:
+    3 checks:
     1. ALL canary pods have istio-proxy container (sidecar injected)
     2. No EnvoyFilter in bleater namespace with fault/abort/Lua injection
-    3. DestinationRule canary subset has matching endpoints (>0 pods)
-    4. DestinationRule stable subset has matching endpoints AND none are canary pods (B6 trap)
+    3. DestinationRule stable/canary subsets resolve cleanly to the intended workloads
     """
     print("\n--- F3: Service Mesh Integrity ---")
     checks_passed = 0
-    total = 4
+    total = 3
 
     # Check 1: Canary pods have istio-proxy sidecar
-    canary_pods_out, rc = run_kubectl(
-        "get", "pods", "-l", f"app={app_label},version=canary",
-        "-o", "json", namespace=NS,
-    )
     canary_count = 0
     sidecar_count = 0
-    if rc == 0 and canary_pods_out:
-        try:
-            pods = json.loads(canary_pods_out)
-            items = pods.get("items", [])
-            canary_count = len(items)
-            for pod in items:
-                if pod_has_istio_proxy(pod.get("spec", {})):
-                    sidecar_count += 1
-        except json.JSONDecodeError:
-            pass
+    canary_pods = _get_role_pods(app_label, "canary")
+    canary_count = len(canary_pods)
+    for pod in canary_pods:
+        if pod_has_istio_proxy(pod.get("spec", {})):
+            sidecar_count += 1
 
     if canary_count >= 1 and sidecar_count == canary_count:
         print(f"  ✅ Check 1: All {canary_count} canary pods have istio-proxy sidecar")
@@ -863,8 +893,11 @@ def check_f3_service_mesh_integrity(app_label):
         print(f"  ✅ Check 2: No EnvoyFilter with fault injection found")
         checks_passed += 1
 
-    # Check 3: DestinationRule canary subset has matching pods
+    # Check 3: DestinationRule subsets resolve cleanly to intended workloads
     canary_selector, stable_selector = _read_dr_subset_selectors(app_label)
+    canary_matching_pods = 0
+    stable_matching_pods = 0
+    canary_in_stable = 0
 
     if canary_selector:
         label_str = ",".join(f"{k}={v}" for k, v in canary_selector.items())
@@ -874,16 +907,8 @@ def check_f3_service_mesh_integrity(app_label):
             "-o", "jsonpath={.items[*].metadata.name}",
             namespace=NS,
         )
-        matching_pods = len(pods_out.split()) if pods_out.strip() else 0
-        if matching_pods >= 1:
-            print(f"  ✅ Check 3: Canary subset ({canary_selector}) matches {matching_pods} pod(s)")
-            checks_passed += 1
-        else:
-            print(f"  ❌ Check 3: Canary subset ({canary_selector}) matches 0 pods")
-    else:
-        print(f"  ❌ Check 3: Could not find canary subset in DestinationRule")
+        canary_matching_pods = len(pods_out.split()) if pods_out.strip() else 0
 
-    # Check 4: Stable subset has matching pods that are NOT canary pods (B6 trap)
     if stable_selector:
         label_str = ",".join(f"{k}={v}" for k, v in stable_selector.items())
         full_label = f"app={app_label},{label_str}"
@@ -891,13 +916,11 @@ def check_f3_service_mesh_integrity(app_label):
             "get", "pods", "-l", full_label,
             "-o", "json", namespace=NS,
         )
-        matching_pods = 0
-        canary_in_stable = 0
         if rc == 0 and pods_out:
             try:
                 pods = json.loads(pods_out)
                 items = pods.get("items", [])
-                matching_pods = len(items)
+                stable_matching_pods = len(items)
                 for pod in items:
                     pod_labels = pod.get("metadata", {}).get("labels", {})
                     pod_name = pod.get("metadata", {}).get("name", "")
@@ -906,17 +929,27 @@ def check_f3_service_mesh_integrity(app_label):
             except json.JSONDecodeError:
                 pass
 
-        if matching_pods >= 1 and canary_in_stable == 0:
-            print(f"  ✅ Check 4: Stable subset ({stable_selector}) matches "
-                  f"{matching_pods} pod(s), none are canary")
-            checks_passed += 1
-        elif matching_pods >= 1 and canary_in_stable > 0:
-            print(f"  ❌ Check 4: Stable subset matches {matching_pods} pods but "
-                  f"{canary_in_stable} are canary pods (label trap not fixed)")
-        else:
-            print(f"  ❌ Check 4: Stable subset ({stable_selector}) matches 0 pods")
+    if not canary_selector and not stable_selector:
+        print("  ❌ Check 3: Could not find stable or canary subset in DestinationRule")
+    elif not canary_selector:
+        print("  ❌ Check 3: Could not find canary subset in DestinationRule")
+    elif not stable_selector:
+        print("  ❌ Check 3: Could not find stable subset in DestinationRule")
+    elif canary_matching_pods < 1:
+        print(f"  ❌ Check 3: Canary subset ({canary_selector}) matches 0 pods")
+    elif stable_matching_pods < 1:
+        print(f"  ❌ Check 3: Stable subset ({stable_selector}) matches 0 pods")
+    elif canary_in_stable > 0:
+        print(
+            f"  ❌ Check 3: Stable subset matches {stable_matching_pods} pods but "
+            f"{canary_in_stable} are canary pods (label trap not fixed)"
+        )
     else:
-        print(f"  ❌ Check 4: Could not find stable subset in DestinationRule")
+        print(
+            f"  ✅ Check 3: Canary subset ({canary_selector}) matches {canary_matching_pods} pod(s) "
+            f"and stable subset ({stable_selector}) matches {stable_matching_pods} non-canary pod(s)"
+        )
+        checks_passed += 1
 
     score = round(checks_passed / total, 2)
     print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F3 ({checks_passed}/{total})")

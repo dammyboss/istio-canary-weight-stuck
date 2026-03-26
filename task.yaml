@@ -18,6 +18,7 @@ prompt: |
   - Grafana canary dashboard shows NaN for all golden signal panels
   - Multiple engineers have made overlapping changes to the Istio and deployment configuration
   - Some manual fixes to traffic routing appear to revert on their own within minutes
+  - The rollout is reconciled from an internal Git-backed controller workflow, so live-only edits will not be sufficient
   - Engineers have been discussing this incident on the team communication platform
 
   Your task is to investigate why canary traffic weight is stuck at 0%, identify the
