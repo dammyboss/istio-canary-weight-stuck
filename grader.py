@@ -168,6 +168,27 @@ def prom_query_value(query):
     return 0.0
 
 
+def wait_for_prom_value(queries, predicate, timeout_seconds=60, interval_seconds=10):
+    """
+    Poll one or more PromQL queries until predicate(value) succeeds or timeout expires.
+    Returns the last observed value.
+    """
+    deadline = time.time() + timeout_seconds
+    last_value = 0.0
+    while time.time() < deadline:
+        for query in queries:
+            last_value = prom_query_value(query)
+            if predicate(last_value):
+                return last_value
+        remaining = deadline - time.time()
+        if remaining > interval_seconds:
+            print(f"  Metric not ready yet, retrying in {interval_seconds}s...")
+            time.sleep(interval_seconds)
+        else:
+            break
+    return last_value
+
+
 def _read_argocd_application(app_label=None):
     """Return the most relevant ArgoCD Application JSON for the runtime bundle task."""
     candidates = _read_all_argocd_applications()
@@ -309,6 +330,86 @@ def _live_gitops_state_ok(app_label):
         return False, f"canary deployment labels={deploy_state.get('labels', {})}"
 
     return True, "live VirtualService, DestinationRule, and canary deployment match intended state"
+
+
+def _has_fault_injection_envoyfilter():
+    """Return (bool, detail) indicating whether a fault-injection EnvoyFilter remains."""
+    ef_out, rc = run_kubectl(
+        "get", "envoyfilter", "-o", "json", namespace=NS,
+    )
+    if rc != 0 or not ef_out:
+        return False, ""
+    try:
+        efs = json.loads(ef_out)
+        for ef in efs.get("items", []):
+            ef_name = ef.get("metadata", {}).get("name", "unknown")
+            patches = ef.get("spec", {}).get("configPatches", [])
+            for patch in patches:
+                patch_value = json.dumps(patch.get("patch", {}).get("value", {}))
+                if any(indicator in patch_value for indicator in [
+                    ":respond(", ":abort(",
+                    '":status"] = "503"', '":status"]=\\"503\\"',
+                ]):
+                    return True, ef_name
+    except json.JSONDecodeError:
+        pass
+    return False, ""
+
+
+def _subsets_resolve_cleanly(app_label):
+    """Return (bool, detail) for whether stable/canary subsets resolve to intended pods."""
+    canary_selector, stable_selector = _read_dr_subset_selectors(app_label)
+    canary_matching_pods = 0
+    stable_matching_pods = 0
+    canary_in_stable = 0
+
+    if canary_selector:
+        label_str = ",".join(f"{k}={v}" for k, v in canary_selector.items())
+        full_label = f"app={app_label},{label_str}"
+        pods_out, rc = run_kubectl(
+            "get", "pods", "-l", full_label,
+            "-o", "jsonpath={.items[*].metadata.name}",
+            namespace=NS,
+        )
+        canary_matching_pods = len(pods_out.split()) if rc == 0 and pods_out.strip() else 0
+
+    if stable_selector:
+        label_str = ",".join(f"{k}={v}" for k, v in stable_selector.items())
+        full_label = f"app={app_label},{label_str}"
+        pods_out, rc = run_kubectl(
+            "get", "pods", "-l", full_label,
+            "-o", "json", namespace=NS,
+        )
+        if rc == 0 and pods_out:
+            try:
+                pods = json.loads(pods_out)
+                items = pods.get("items", [])
+                stable_matching_pods = len(items)
+                for pod in items:
+                    pod_labels = pod.get("metadata", {}).get("labels", {})
+                    pod_name = pod.get("metadata", {}).get("name", "")
+                    if pod_labels.get("track") == "canary" or pod_labels.get("version") == "canary" or "canary" in pod_name:
+                        canary_in_stable += 1
+            except json.JSONDecodeError:
+                pass
+
+    if not canary_selector and not stable_selector:
+        return False, "could not find stable or canary subset in DestinationRule"
+    if not canary_selector:
+        return False, "could not find canary subset in DestinationRule"
+    if not stable_selector:
+        return False, "could not find stable subset in DestinationRule"
+    if canary_matching_pods < 1:
+        return False, f"canary subset ({canary_selector}) matches 0 pods"
+    if stable_matching_pods < 1:
+        return False, f"stable subset ({stable_selector}) matches 0 pods"
+    if canary_in_stable > 0:
+        return False, f"stable subset matches {stable_matching_pods} pods but {canary_in_stable} are canary pods"
+
+    return True, (
+        f"canary subset ({canary_selector}) matches {canary_matching_pods} pod(s) and "
+        f"stable subset ({stable_selector}) matches {stable_matching_pods} non-canary pod(s)"
+    )
 
 
 def _resource_has_drift_behavior(resource):
@@ -609,7 +710,7 @@ def cleanup_and_wait():
 
 
 # ======================================================================
-# F1: CANARY TRAFFIC & OBSERVABILITY (25%)
+# F1: CANARY TRAFFIC & OBSERVABILITY (30%)
 #
 # Merged F1 (traffic routing) + F5 (golden signals) into a single subscore.
 # Verifies traffic reaches canary AND is observable via Prometheus metrics.
@@ -661,21 +762,17 @@ def check_f1_canary_traffic_observability(app_label, svc_name):
               f"(expected stable:90, canary:10)")
 
     # Generate traffic so Prometheus has data to query
-    generate_mesh_traffic(app_label, svc_name, num_requests=200)
-    print("  Waiting 20s for Prometheus scrape cycle...")
-    time.sleep(20)
+    generate_mesh_traffic(app_label, svc_name, num_requests=300)
+    print("  Waiting up to 60s for Prometheus to observe canary traffic...")
 
     # Check 3: Canary HTTP 200 response rate > 0 (traffic flows AND succeeds)
     # Combines F1's "traffic reaches canary" with F5's "successful responses"
-    canary_200_rate = 0.0
-    for query in [
+    canary_queries = [
         f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code="200",reporter="destination"}}[5m]))',
         f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",response_code="200"}}[5m]))',
         f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code=~"2.."}}[5m]))',
-    ]:
-        canary_200_rate = prom_query_value(query)
-        if canary_200_rate > 0:
-            break
+    ]
+    canary_200_rate = wait_for_prom_value(canary_queries, lambda value: value > 0)
 
     if canary_200_rate > 0:
         print(f"  ✅ Check 3: Canary 200 response rate = {canary_200_rate:.4f} req/s")
@@ -685,25 +782,15 @@ def check_f1_canary_traffic_observability(app_label, svc_name):
 
     # Check 4: destination_version label propagation in Prometheus
     # Verifies end-to-end observability: pod labels → Istio telemetry → Prometheus
-    version_labels_exist = False
-    for query in [
+    version_labels_exist = wait_for_prom_value([
         f'count(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary"}})',
         f'count(istio_requests_total{{destination_app="{app_label}",destination_version="canary"}})',
-    ]:
-        count = prom_query_value(query)
-        if count > 0:
-            version_labels_exist = True
-            break
+    ], lambda value: value > 0) > 0
 
-    stable_labels_exist = False
-    for query in [
+    stable_labels_exist = wait_for_prom_value([
         f'count(istio_requests_total{{destination_service_name="{svc_name}",destination_version="stable"}})',
         f'count(istio_requests_total{{destination_app="{app_label}",destination_version="stable"}})',
-    ]:
-        count = prom_query_value(query)
-        if count > 0:
-            stable_labels_exist = True
-            break
+    ], lambda value: value > 0) > 0
 
     if version_labels_exist and stable_labels_exist:
         print(f"  ✅ Check 4: Both destination_version=canary and =stable labels in Prometheus")
@@ -721,7 +808,7 @@ def check_f1_canary_traffic_observability(app_label, svc_name):
 
 
 # ======================================================================
-# F2: GITOPS CONVERGENCE (20%)
+# F2: GITOPS CONVERGENCE (35%)
 # ======================================================================
 
 def check_f2_gitops_convergence(app_label):
@@ -790,11 +877,20 @@ def check_f2_gitops_convergence(app_label):
 
     # Check 3: Live state must match the intended GitOps outcome
     live_ok, live_msg = _live_gitops_state_ok(app_label)
-    if live_ok:
-        print(f"  ✅ Check 3: {live_msg}")
+    fault_filter_present, fault_filter_name = _has_fault_injection_envoyfilter()
+    subsets_ok, subsets_msg = _subsets_resolve_cleanly(app_label)
+    if live_ok and not fault_filter_present and subsets_ok:
+        print(f"  ✅ Check 3: {live_msg}; {subsets_msg}; no fault-injection EnvoyFilter remains")
         checks_passed += 1
     else:
-        print(f"  ❌ Check 3: {live_msg}")
+        issues = []
+        if not live_ok:
+            issues.append(live_msg)
+        if fault_filter_present:
+            issues.append(f"fault-injection EnvoyFilter still present ({fault_filter_name})")
+        if not subsets_ok:
+            issues.append(subsets_msg)
+        print(f"  ❌ Check 3: {'; '.join(issues)}")
 
     # Check 4: Hard refresh must keep the app Synced and preserve the live state
     if live_ok:
@@ -830,7 +926,7 @@ def check_f2_gitops_convergence(app_label):
 
 
 # ======================================================================
-# F3: SERVICE MESH INTEGRITY (20%)
+# AUXILIARY: SERVICE MESH INTEGRITY (UNSCORED HELPER KEPT FOR ANALYSIS)
 # ======================================================================
 
 def check_f3_service_mesh_integrity(app_label):
@@ -957,7 +1053,7 @@ def check_f3_service_mesh_integrity(app_label):
 
 
 # ======================================================================
-# F4: DRIFT RESILIENCE (20%)
+# F4: DRIFT RESILIENCE (35%)
 # ======================================================================
 
 def check_f4_drift_resilience(app_label):
@@ -1054,25 +1150,17 @@ def check_f4_drift_resilience(app_label):
 
     # Check 4: Canary traffic remains observable after the durability window
     svc_name = discover_svc_name(app_label)
-    generate_mesh_traffic(app_label, svc_name, num_requests=120)
-    print("  Waiting 20s for Prometheus scrape cycle...")
-    time.sleep(20)
-    canary_rate = 0.0
-    stable_labels = False
-    for query in [
+    generate_mesh_traffic(app_label, svc_name, num_requests=200)
+    print("  Waiting up to 60s for Prometheus to observe post-durability traffic...")
+    canary_queries = [
         f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code=~"2..",reporter="destination"}}[5m]))',
         f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",response_code=~"2.."}}[5m]))',
-    ]:
-        canary_rate = prom_query_value(query)
-        if canary_rate > 0:
-            break
-    for query in [
+    ]
+    canary_rate = wait_for_prom_value(canary_queries, lambda value: value > 0)
+    stable_labels = wait_for_prom_value([
         f'count(istio_requests_total{{destination_service_name="{svc_name}",destination_version="stable"}})',
         f'count(istio_requests_total{{destination_app="{app_label}",destination_version="stable"}})',
-    ]:
-        if prom_query_value(query) > 0:
-            stable_labels = True
-            break
+    ], lambda value: value > 0) > 0
     if canary_rate > 0 and stable_labels:
         print(f"  ✅ Check 4: Canary traffic still observable after durability window ({canary_rate:.4f} req/s)")
         checks_passed += 1
@@ -1093,7 +1181,7 @@ def grade(transcript: str) -> GradingResult:
     Main grading function.
 
     Pre-grading: Kill ubuntu processes, wait 90s for drift enforcers.
-    Then run 4 functional subscores, each with 4 all-or-nothing checks.
+    Then run 3 functional subscores covering traffic, declarative convergence, and durability.
     """
     os.environ["KUBECONFIG"] = KUBECONFIG
 
@@ -1107,13 +1195,13 @@ def grade(transcript: str) -> GradingResult:
     subscores = {}
     weights = {}
 
-    # F1: Canary Traffic & Observability (merged F1+F5)
+    # F1: Canary Traffic & Observability
     try:
         subscores["canary_traffic_observability"] = check_f1_canary_traffic_observability(app_label, svc_name)
     except Exception as e:
         print(f"Error in F1: {e}")
         subscores["canary_traffic_observability"] = 0.0
-    weights["canary_traffic_observability"] = 0.25
+    weights["canary_traffic_observability"] = 0.30
 
     # F2: GitOps Convergence
     try:
@@ -1121,15 +1209,7 @@ def grade(transcript: str) -> GradingResult:
     except Exception as e:
         print(f"Error in F2: {e}")
         subscores["gitops_convergence"] = 0.0
-    weights["gitops_convergence"] = 0.25
-
-    # F3: Service Mesh Integrity
-    try:
-        subscores["service_mesh_integrity"] = check_f3_service_mesh_integrity(app_label)
-    except Exception as e:
-        print(f"Error in F3: {e}")
-        subscores["service_mesh_integrity"] = 0.0
-    weights["service_mesh_integrity"] = 0.25
+    weights["gitops_convergence"] = 0.35
 
     # F4: Drift Resilience
     try:
@@ -1137,7 +1217,7 @@ def grade(transcript: str) -> GradingResult:
     except Exception as e:
         print(f"Error in F4: {e}")
         subscores["drift_resilience"] = 0.0
-    weights["drift_resilience"] = 0.25
+    weights["drift_resilience"] = 0.35
 
     # Calculate weighted score
     total_weight = sum(weights.values())
@@ -1145,10 +1225,9 @@ def grade(transcript: str) -> GradingResult:
 
     # Build feedback
     labels = {
-        "canary_traffic_observability": ("F1", "Canary traffic & observability — routing, metrics, labels (25%)"),
-        "gitops_convergence": ("F2", "GitOps convergence — ArgoCD synced, Git repo correct (25%)"),
-        "service_mesh_integrity": ("F3", "Service mesh integrity — sidecar, EnvoyFilter, subsets (25%)"),
-        "drift_resilience": ("F4", "Drift resilience — enforcers removed, prune enabled, fixes persist (25%)"),
+        "canary_traffic_observability": ("F1", "Canary traffic & observability — routing, pods, metrics (30%)"),
+        "gitops_convergence": ("F2", "Declarative convergence — ArgoCD source, Git state, live state (35%)"),
+        "drift_resilience": ("F3", "Durability — drift removal, reconciliation, post-refresh traffic (35%)"),
     }
 
     feedback_lines = []
