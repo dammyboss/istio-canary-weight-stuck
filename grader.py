@@ -710,7 +710,7 @@ def cleanup_and_wait():
 
 
 # ======================================================================
-# F1: CANARY TRAFFIC & OBSERVABILITY (30%)
+# F1: CANARY TRAFFIC & OBSERVABILITY (33.3%)
 #
 # Merged F1 (traffic routing) + F5 (golden signals) into a single subscore.
 # Verifies traffic reaches canary AND is observable via Prometheus metrics.
@@ -808,7 +808,7 @@ def check_f1_canary_traffic_observability(app_label, svc_name):
 
 
 # ======================================================================
-# F2: GITOPS CONVERGENCE (35%)
+# F2: GITOPS CONVERGENCE (33.3%)
 # ======================================================================
 
 def check_f2_gitops_convergence(app_label):
@@ -1053,7 +1053,7 @@ def check_f3_service_mesh_integrity(app_label):
 
 
 # ======================================================================
-# F4: DRIFT RESILIENCE (35%)
+# F4: DRIFT RESILIENCE (33.3%)
 # ======================================================================
 
 def check_f4_drift_resilience(app_label):
@@ -1201,7 +1201,7 @@ def grade(transcript: str) -> GradingResult:
     except Exception as e:
         print(f"Error in F1: {e}")
         subscores["canary_traffic_observability"] = 0.0
-    weights["canary_traffic_observability"] = 0.30
+    weights["canary_traffic_observability"] = 1 / 3
 
     # F2: GitOps Convergence
     try:
@@ -1209,7 +1209,7 @@ def grade(transcript: str) -> GradingResult:
     except Exception as e:
         print(f"Error in F2: {e}")
         subscores["gitops_convergence"] = 0.0
-    weights["gitops_convergence"] = 0.35
+    weights["gitops_convergence"] = 1 / 3
 
     # F4: Drift Resilience
     try:
@@ -1217,7 +1217,7 @@ def grade(transcript: str) -> GradingResult:
     except Exception as e:
         print(f"Error in F4: {e}")
         subscores["drift_resilience"] = 0.0
-    weights["drift_resilience"] = 0.35
+    weights["drift_resilience"] = 1 / 3
 
     # Calculate weighted score
     total_weight = sum(weights.values())
@@ -1225,9 +1225,9 @@ def grade(transcript: str) -> GradingResult:
 
     # Build feedback
     labels = {
-        "canary_traffic_observability": ("F1", "Canary traffic & observability — routing, pods, metrics (30%)"),
-        "gitops_convergence": ("F2", "Declarative convergence — ArgoCD source, Git state, live state (35%)"),
-        "drift_resilience": ("F3", "Durability — drift removal, reconciliation, post-refresh traffic (35%)"),
+        "canary_traffic_observability": ("F1", "Canary traffic & observability — routing, pods, metrics (33.3%)"),
+        "gitops_convergence": ("F2", "Declarative convergence — ArgoCD source, Git state, live state (33.3%)"),
+        "drift_resilience": ("F3", "Durability — drift removal, reconciliation, post-refresh traffic (33.3%)"),
     }
 
     feedback_lines = []
