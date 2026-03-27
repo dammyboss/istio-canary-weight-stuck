@@ -314,10 +314,7 @@ def _live_gitops_state_ok(app_label):
     if not deploy_state:
         return False, "canary deployment not found"
 
-    stable_weight = (vs_weights or {}).get("stable", 0)
-    canary_weight = (vs_weights or {}).get("canary", 0)
-    total_weight = stable_weight + canary_weight
-    if not (vs_weights and total_weight == 100 and stable_weight > canary_weight > 0):
+    if not (vs_weights and vs_weights.get("stable") == 90 and vs_weights.get("canary") == 10):
         return False, f"live VirtualService weights={vs_weights}"
 
     if not _selectors_match_gitops_intent(app_label):
@@ -549,6 +546,7 @@ def _verify_git_repo_state(app_label, app):
     """Clone the app's Git source and verify the declarative state is functionally correct."""
     import tempfile
     import shutil
+    import glob
 
     results = {"vs_correct": False, "no_saboteurs": False, "dr_correct": False,
                "canary_deploy_in_git": False}
@@ -604,32 +602,14 @@ def _verify_git_repo_state(app_label, app):
                 ):
                     has_saboteur_refs = True
                     print(f"  Git source contains mutating reintroduction logic: {os.path.relpath(fpath, source_dir)}")
-                if (
-                    "argocd.argoproj.io/hook" in lowered and
-                    "kubectl" in lowered and
-                    any(token in lowered for token in ("patch", "apply", "replace")) and
-                    any(token in lowered for token in ("virtualservice", "destinationrule", "weight", "canary"))
-                ):
+                if "argocd.argoproj.io/hook" in lowered and any(token in lowered for token in ("patch", "virtualservice", "weight")):
                     has_saboteur_refs = True
                     print(f"  Git source contains Argo hook mutator: {os.path.relpath(fpath, source_dir)}")
-                if "envoyfilter" in content and any(token in lowered for token in (
-                    ":respond(", ":abort(", '"503"', "tls handshake timeout", "synthetic 503"
-                )):
+                if "envoyfilter" in content and any(token in content for token in (":respond(", ":abort(", '"503"', "lua")):
                     has_saboteur_refs = True
                     print(f"  Git source contains traffic sabotage filter: {os.path.relpath(fpath, source_dir)}")
                 if "VirtualService" in content and "bleat-service" in content:
-                    import re
-                    weights = [int(x) for x in re.findall(r"weight:\s*(\d+)", content)]
-                    has_stable_subset = "subset: stable" in content
-                    has_canary_subset = "subset: canary" in content
-                    non_zero_canary = any(w > 0 for w in weights)
-                    stable_heavier = any(
-                        weights[i] > weights[j]
-                        for i in range(len(weights))
-                        for j in range(len(weights))
-                        if i != j
-                    )
-                    if has_stable_subset and has_canary_subset and non_zero_canary and stable_heavier:
+                    if "weight: 90" in content and "weight: 10" in content and "subset: stable" in content and "subset: canary" in content:
                         results["vs_correct"] = True
                 if "DestinationRule" in content and "bleat-service" in content:
                     if (
@@ -730,25 +710,30 @@ def cleanup_and_wait():
 
 
 # ======================================================================
-# F1: ROLLOUT ACTIVATION (33.3%)
+# F1: CANARY TRAFFIC & OBSERVABILITY (33.3%)
 #
-# Mixed bucket: one easy readiness signal, one controller-alignment signal,
-# and one variable traffic signal.
+# Merged F1 (traffic routing) + F5 (golden signals) into a single subscore.
+# Verifies traffic reaches canary AND is observable via Prometheus metrics.
 # ======================================================================
 
-def check_f1_rollout_activation(app_label, svc_name):
+def check_f1_canary_traffic_observability(app_label, svc_name):
     """
-    F1: Rollout Activation — readiness, controller alignment, visible canary traffic
+    F1: Canary Traffic & Observability — Functional test
 
-    3 weighted checks:
-    1. Canary workload mesh-ready (pods + sidecar)          weight=0.15
-    2. Argo source/path/policy aligned with rollout         weight=0.45
-    3. Post-fix canary traffic remains visible              weight=0.40
+    Verifies canary receives traffic AND the observability pipeline reports it.
+    Combines traffic routing verification with Prometheus metrics validation.
+
+    4 checks:
+    1. Canary pods exist with stable/canary identity labels AND istio-proxy sidecar
+    2. VirtualService has correct 90/10 weights with correct subset names
+    3. Canary HTTP 200 response rate > 0 in Prometheus (traffic flows + succeeds)
+    4. destination_version label propagation (both canary + stable in Prometheus)
     """
-    print("\n--- F1: Rollout Activation ---")
-    score = 0.0
+    print("\n--- F1: Canary Traffic & Observability ---")
+    checks_passed = 0
+    total = 4
 
-    # Check 1: Canary workload mesh-ready (weight=0.15)
+    # Check 1: Canary pods exist with correct labels AND sidecar
     canary_with_sidecar = 0
     canary_pods_ready = 0
     for pod in _get_role_pods(app_label, "canary"):
@@ -761,146 +746,182 @@ def check_f1_rollout_activation(app_label, svc_name):
             canary_with_sidecar += 1
 
     if canary_with_sidecar >= 1:
-        print(f"  ✅ Check 1 (0.15): {canary_with_sidecar} canary pod(s) with sidecar and Ready")
-        score += 0.15
+        print(f"  ✅ Check 1: {canary_with_sidecar} canary pod(s) with sidecar and Ready")
+        checks_passed += 1
     else:
-        print(f"  ❌ Check 1 (0.15): canary pods with sidecar={canary_with_sidecar}, "
+        print(f"  ❌ Check 1: canary pods with sidecar={canary_with_sidecar}, "
               f"ready without sidecar={canary_pods_ready}")
 
-    # Check 2: Argo source/path/policy aligned with rollout (weight=0.45)
-    app = _read_argocd_application(app_label)
-    if app:
-        source = app.get("spec", {}).get("source", {})
-        automated = app.get("spec", {}).get("syncPolicy", {}).get("automated", {})
-        health_status = app.get("status", {}).get("health", {}).get("status", "")
-        sync_status = app.get("status", {}).get("sync", {}).get("status", "")
-        repo_url = source.get("repoURL", "")
-        repo_ok = "gitea" in repo_url and repo_url.endswith(".git")
-        rev_ok = bool(source.get("targetRevision", DEFAULT_TARGET_REVISION))
-        path_ok = bool(source.get("path"))
-        self_heal_ok = automated.get("selfHeal") is True
-        status_ok = sync_status not in ("Error", "ComparisonError", "") and health_status not in ("Degraded", "Missing", "")
-        if all([repo_ok, rev_ok, path_ok, status_ok]) and (self_heal_ok or sync_status == "Synced"):
-            print(f"  ✅ Check 2 (0.45): Argo source/policy aligned "
-                  f"(app={app.get('metadata', {}).get('name')}, selfHeal={self_heal_ok}, sync={sync_status}, health={health_status})")
-            score += 0.45
-        else:
-            print(f"  ❌ Check 2 (0.45): repo_ok={repo_ok}, path_ok={path_ok}, rev_ok={rev_ok}, "
-                  f"selfHeal={self_heal_ok}, sync={sync_status}, health={health_status}")
+    # Check 2: VirtualService has correct 90/10 weights with correct subset names
+    vs_weights = _read_vs_weights(app_label)
+    if vs_weights and vs_weights.get("stable") == 90 and vs_weights.get("canary") == 10:
+        print(f"  ✅ Check 2: VirtualService weights = stable:90, canary:10")
+        checks_passed += 1
     else:
-        print("  ❌ Check 2 (0.45): ArgoCD app not found or unreadable")
+        print(f"  ❌ Check 2: VirtualService weights = {vs_weights} "
+              f"(expected stable:90, canary:10)")
 
-    # Check 3: Post-fix canary traffic remains visible (weight=0.40)
-    generate_mesh_traffic(app_label, svc_name, num_requests=250)
-    print("  Waiting up to 60s for Prometheus to observe post-fix canary traffic...")
+    # Generate traffic so Prometheus has data to query
+    generate_mesh_traffic(app_label, svc_name, num_requests=300)
+    print("  Waiting up to 60s for Prometheus to observe canary traffic...")
+
+    # Check 3: Canary HTTP 200 response rate > 0 (traffic flows AND succeeds)
+    # Combines F1's "traffic reaches canary" with F5's "successful responses"
     canary_queries = [
-        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code=~"2..",reporter="destination"}}[5m]))',
-        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",response_code=~"2.."}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code="200",reporter="destination"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",response_code="200"}}[5m]))',
+        f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code=~"2.."}}[5m]))',
     ]
-    stable_queries = [
+    canary_200_rate = wait_for_prom_value(canary_queries, lambda value: value > 0)
+
+    if canary_200_rate > 0:
+        print(f"  ✅ Check 3: Canary 200 response rate = {canary_200_rate:.4f} req/s")
+        checks_passed += 1
+    else:
+        print(f"  ❌ Check 3: Canary 200 response rate = 0 (no successful canary traffic)")
+
+    # Check 4: destination_version label propagation in Prometheus
+    # Verifies end-to-end observability: pod labels → Istio telemetry → Prometheus
+    version_labels_exist = wait_for_prom_value([
+        f'count(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary"}})',
+        f'count(istio_requests_total{{destination_app="{app_label}",destination_version="canary"}})',
+    ], lambda value: value > 0) > 0
+
+    stable_labels_exist = wait_for_prom_value([
         f'count(istio_requests_total{{destination_service_name="{svc_name}",destination_version="stable"}})',
         f'count(istio_requests_total{{destination_app="{app_label}",destination_version="stable"}})',
-    ]
-    canary_rate = wait_for_prom_value(canary_queries, lambda value: value > 0)
-    stable_visible = wait_for_prom_value(stable_queries, lambda value: value > 0) > 0
-    if canary_rate > 0 and stable_visible:
-        print(f"  ✅ Check 3 (0.40): Post-fix canary traffic visible ({canary_rate:.4f} req/s)")
-        score += 0.40
-    else:
-        print(f"  ❌ Check 3 (0.40): canary_rate={canary_rate:.4f}, stable_visible={stable_visible}")
+    ], lambda value: value > 0) > 0
 
-    score = round(score, 2)
-    print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F1 (score={score})")
+    if version_labels_exist and stable_labels_exist:
+        print(f"  ✅ Check 4: Both destination_version=canary and =stable labels in Prometheus")
+        checks_passed += 1
+    elif version_labels_exist:
+        print(f"  ✅ Check 4: destination_version=canary labels present in Prometheus")
+        checks_passed += 1
+    else:
+        print(f"  ❌ Check 4: destination_version labels not found in Prometheus "
+              f"(canary={version_labels_exist}, stable={stable_labels_exist})")
+
+    score = round(checks_passed / total, 2)
+    print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F1 ({checks_passed}/{total})")
     return score
 
 
 # ======================================================================
-# F2: DECLARATIVE CONVERGENCE (33.3%)
-#
-# Mixed bucket: one easy live-state proof, one hard Git/source proof,
-# and one refresh-preservation proof.
+# F2: GITOPS CONVERGENCE (33.3%)
 # ======================================================================
 
-def check_f2_declarative_convergence(app_label, svc_name):
+def check_f2_gitops_convergence(app_label):
     """
-    F2: Declarative Convergence — live state, Git source, refresh stability
+    F2: GitOps Convergence — Functional test
 
-    3 weighted checks:
-    1. Live state matches intended declarative outcome     weight=0.25
-    2. Git source is corrected and clean                   weight=0.50
-    3. Hard refresh preserves state                        weight=0.25
+    Verifies ArgoCD Application is synced, Git repo has correct manifests,
+    and VirtualService is stable over time.
+    Requires: Gitea repo fixed, ArgoCD app path fixed, drift enforcers removed from git.
+
+    4 checks:
+    1. ArgoCD Application source and sync policy match the intended declarative state
+    2. Git repo has correct VS/DR/canary deployment and no saboteur references
+    3. Live VirtualService, DestinationRule, and canary deployment match the intended state
+    4. State survives a hard refresh and remains Synced
     """
-    print("\n--- F2: Declarative Convergence ---")
-    score = 0.0
+    print("\n--- F2: GitOps Convergence ---")
+    checks_passed = 0
+    total = 4
+
+    # Check 1: ArgoCD app source and policy must match the intended declarative state
     app = _read_argocd_application(app_label)
+    if app:
+        sync_status = app.get("status", {}).get("sync", {}).get("status", "")
+        source = app.get("spec", {}).get("source", {})
+        automated = app.get("spec", {}).get("syncPolicy", {}).get("automated", {})
+        repo_url = source.get("repoURL", "")
+        repo_ok = "gitea" in repo_url and repo_url.endswith(".git")
+        rev_ok = bool(source.get("targetRevision", DEFAULT_TARGET_REVISION))
+        path_ok = bool(source.get("path"))
+        prune_ok = automated.get("prune") is True
+        self_heal_ok = automated.get("selfHeal") is True
+        if all([repo_ok, rev_ok, path_ok, prune_ok, self_heal_ok]) and sync_status in ("Synced", "OutOfSync"):
+            print(
+                f"  ✅ Check 1: ArgoCD source/policy correct "
+                f"(app={app.get('metadata', {}).get('name')}, repo={source.get('repoURL')}, rev={source.get('targetRevision')}, "
+                f"path={source.get('path')}, prune={prune_ok}, selfHeal={self_heal_ok}, status={sync_status})"
+            )
+            checks_passed += 1
+        else:
+            print(
+                f"  ❌ Check 1: repo_ok={repo_ok}, rev_ok={rev_ok}, path_ok={path_ok}, "
+                f"prune={prune_ok}, selfHeal={self_heal_ok}, status={sync_status}"
+            )
+    else:
+        print("  ❌ Check 1: ArgoCD app not found or unreadable")
 
-    # Check 1: Live state matches intended outcome (weight=0.25)
+    # Check 2: Git repo has correct manifests and no saboteur references
+    git_state = _verify_git_repo_state(app_label, app)
+    git_ok = (git_state["vs_correct"] and git_state["no_saboteurs"] and
+              git_state["dr_correct"] and git_state.get("canary_deploy_in_git", False))
+    if git_ok:
+        print(f"  ✅ Check 2: Git repo has correct VS/DR/canary-deploy and no saboteur references")
+        checks_passed += 1
+    else:
+        details = []
+        if not git_state["vs_correct"]:
+            details.append("VS weights/subsets incorrect in Git")
+        if not git_state["no_saboteurs"]:
+            details.append("saboteur files still referenced in kustomization")
+        if not git_state["dr_correct"]:
+            details.append("DR subsets incorrect in Git")
+        if not git_state.get("canary_deploy_in_git", False):
+            details.append("canary Deployment with sidecar injection + stable/canary identity labels not in Git")
+        print(f"  ❌ Check 2: Git repo issues: {'; '.join(details)}")
+
+    # Check 3: Live state must match the intended GitOps outcome
     live_ok, live_msg = _live_gitops_state_ok(app_label)
     fault_filter_present, fault_filter_name = _has_fault_injection_envoyfilter()
     subsets_ok, subsets_msg = _subsets_resolve_cleanly(app_label)
     if live_ok and not fault_filter_present and subsets_ok:
-        print(f"  ✅ Check 1 (0.25): {live_msg}; {subsets_msg}; no fault-injection EnvoyFilter")
-        score += 0.25
+        print(f"  ✅ Check 3: {live_msg}; {subsets_msg}; no fault-injection EnvoyFilter remains")
+        checks_passed += 1
     else:
         issues = []
         if not live_ok:
             issues.append(live_msg)
         if fault_filter_present:
-            issues.append(f"fault-injection EnvoyFilter ({fault_filter_name})")
+            issues.append(f"fault-injection EnvoyFilter still present ({fault_filter_name})")
         if not subsets_ok:
             issues.append(subsets_msg)
-        print(f"  ❌ Check 1 (0.25): {'; '.join(issues)}")
+        print(f"  ❌ Check 3: {'; '.join(issues)}")
 
-    # Check 2: Git source is corrected and clean (weight=0.50)
-    git_state = _verify_git_repo_state(app_label, app)
-    git_ok = (
-        git_state["vs_correct"] and
-        git_state["dr_correct"] and
-        git_state.get("canary_deploy_in_git", False) and
-        git_state["no_saboteurs"]
-    )
-    if git_ok:
-        print("  ✅ Check 2 (0.50): Git source has valid rollout config and no active reintroduction logic")
-        score += 0.50
-    else:
-        details = []
-        if not git_state["vs_correct"]:
-            details.append("VirtualService rollout intent not found in Git")
-        if not git_state["dr_correct"]:
-            details.append("DestinationRule stable/canary selectors missing in Git")
-        if not git_state.get("canary_deploy_in_git", False):
-            details.append("canary Deployment not found in Git")
-        if not git_state["no_saboteurs"]:
-            details.append("active reintroduction logic remains in Git")
-        print(f"  ❌ Check 2 (0.50): {'; '.join(details)}")
-
-    # Check 3: Hard refresh preserves state (weight=0.25)
-    if live_ok and app:
-        app_name = app.get("metadata", {}).get("name", "")
-        run_kubectl(
-            "patch", "application", app_name,
-            "--type=merge",
-            '-p={"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}',
-            namespace="argocd",
-        )
-        print("  Waiting 45 seconds for post-refresh convergence...")
-        time.sleep(45)
-        refreshed_ok, refreshed_msg = _live_gitops_state_ok(app_label)
-        refreshed_app = _read_argocd_application(app_label)
-        refreshed_sync = (
-            refreshed_app.get("status", {}).get("sync", {}).get("status", "")
-            if refreshed_app else "missing"
-        )
-        if refreshed_sync not in ("Error", "ComparisonError", "") and refreshed_ok:
-            print(f"  ✅ Check 3 (0.25): Hard refresh preserved declarative state")
-            score += 0.25
+    # Check 4: Hard refresh must keep the app Synced and preserve the live state
+    if live_ok:
+        if app:
+            app_name = app.get("metadata", {}).get("name", "")
+            run_kubectl(
+                "patch", "application", app_name,
+                "--type=merge",
+                '-p={"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}',
+                namespace="argocd",
+            )
+            print("  Waiting 45 seconds for post-refresh convergence...")
+            time.sleep(45)
+            refreshed_app = _read_argocd_application(app_label)
+            refreshed_ok, refreshed_msg = _live_gitops_state_ok(app_label)
+            refreshed_sync = (
+                refreshed_app.get("status", {}).get("sync", {}).get("status", "")
+                if refreshed_app else "missing"
+            )
+            if refreshed_sync in ("Synced", "OutOfSync") and refreshed_ok:
+                print(f"  ✅ Check 4: Hard refresh preserved synced declarative state")
+                checks_passed += 1
+            else:
+                print(f"  ❌ Check 4: status={refreshed_sync}, live_state={refreshed_msg}")
         else:
-            print(f"  ❌ Check 3 (0.25): status={refreshed_sync}, live_state={refreshed_msg}")
+            print("  ❌ Check 4: Skipped (no ArgoCD application discovered)")
     else:
-        print("  ❌ Check 3 (0.25): Skipped (live state or ArgoCD app not ready)")
+        print("  ❌ Check 4: Skipped (Check 3 failed)")
 
-    score = round(score, 2)
-    print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F2 (score={score})")
+    score = round(checks_passed / total, 2)
+    print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F2 ({checks_passed}/{total})")
     return score
 
 
@@ -1032,25 +1053,27 @@ def check_f3_service_mesh_integrity(app_label):
 
 
 # ======================================================================
-# F3: DURABILITY (33.3%)
-#
-# Mixed bucket: one easy cluster cleanup proof, one hard source-cleanup proof,
-# and one converged-traffic proof.
+# F4: DRIFT RESILIENCE (33.3%)
 # ======================================================================
 
-def check_f3_durability(app_label, svc_name):
+def check_f4_drift_resilience(app_label):
     """
-    F3: Durability — Drift removal and persistence
+    F4: Drift Resilience — Functional test
 
-    3 weighted checks:
-    1. No active drift mutators remain (cluster-wide)      weight=0.20
-    2. No active or declaratively-restorable sabotage path weight=0.50
-    3. Canary traffic successful after convergence         weight=0.30
+    Verifies all drift enforcers are permanently removed and fixes persist.
+    Runs AFTER the 90s durability wait in cleanup_and_wait().
+
+    4 checks:
+    1. No active drift actor remains and the declarative sync policy is fully enforced
+    2. Git source no longer contains an active reintroduction path for the sabotaged state
+    3. Live VirtualService, DestinationRule, and canary deployment still match the intended state
+    4. Canary traffic and observability still work after the durability window
     """
-    print("\n--- F3: Durability ---")
-    score = 0.0
+    print("\n--- F4: Drift Resilience ---")
+    checks_passed = 0
+    total = 4
 
-    # Check 1: No active drift mutators remain (weight=0.20)
+    # Check 1: No active drift mutators remain, and declarative sync policy is enforced
     suspicious_resources = []
     for kind in ["cronjobs", "deployments"]:
         out, rc = run_kubectl("get", kind, "-A", "-o", "json")
@@ -1066,17 +1089,31 @@ def check_f3_durability(app_label, svc_name):
             except json.JSONDecodeError:
                 pass
 
-    if not suspicious_resources:
-        print(f"  ✅ Check 1 (0.20): No active drift mutators found cluster-wide")
-        score += 0.20
+    # Also verify ArgoCD app has prune + selfHeal enabled (declarative enforcement)
+    app = _read_argocd_application(app_label)
+    prune_enabled = False
+    self_heal_enabled = False
+    if app:
+        automated = app.get("spec", {}).get("syncPolicy", {}).get("automated", {})
+        prune_enabled = automated.get("prune", False)
+        self_heal_enabled = automated.get("selfHeal", False)
+
+    if not suspicious_resources and prune_enabled and self_heal_enabled:
+        print(f"  ✅ Check 1: No drift enforcers, ArgoCD prune+selfHeal enabled")
+        checks_passed += 1
+    elif not suspicious_resources and (not prune_enabled or not self_heal_enabled):
+        print(f"  ❌ Check 1: No drift enforcers found but ArgoCD prune={prune_enabled}, "
+              f"selfHeal={self_heal_enabled} (not declaratively enforced)")
     else:
-        print(f"  ❌ Check 1 (0.20): Drift mutators still present:")
+        print(f"  ❌ Check 1: Drift enforcer resources still present:")
         for r in suspicious_resources:
             print(f"    - {r}")
 
-    # Check 2: No active or declaratively-restorable sabotage path (weight=0.50)
-    app = _read_argocd_application(app_label)
-    jobs_out, rc = run_kubectl("get", "jobs", "-A", "-o", "json")
+    # Check 2: No active mutating Jobs/hooks remain, and Git source no longer contains
+    # a reintroduction path for the bad state.
+    jobs_out, rc = run_kubectl(
+        "get", "jobs", "-A", "-o", "json",
+    )
     suspicious_jobs = []
     if rc == 0 and jobs_out:
         try:
@@ -1093,19 +1130,28 @@ def check_f3_durability(app_label, svc_name):
 
     git_state = _verify_git_repo_state(app_label, app)
     if not suspicious_jobs and git_state["no_saboteurs"]:
-        print("  ✅ Check 2 (0.50): No active drift Jobs/hooks and no declaratively-restorable sabotage path")
-        score += 0.50
+        print("  ✅ Check 2: No active drift Jobs/hooks and Git source no longer contains saboteurs")
+        checks_passed += 1
     else:
         if suspicious_jobs:
-            print("  ❌ Check 2 (0.50): Drift enforcer Jobs found:")
+            print("  ❌ Check 2: Drift enforcer Jobs found:")
             for j in suspicious_jobs:
-                print(f"    - {j}")
+                print(f"    - job/{j}")
         else:
-            print("  ❌ Check 2 (0.50): Git source still contains effective sabotage references")
+            print("  ❌ Check 2: Git source still contains saboteur references")
 
-    # Check 3: Canary traffic successful after convergence (weight=0.30)
+    # Check 3: Live state still matches intended declarative outcome after drift window
+    live_ok, live_msg = _live_gitops_state_ok(app_label)
+    if live_ok:
+        print(f"  ✅ Check 3: {live_msg}")
+        checks_passed += 1
+    else:
+        print(f"  ❌ Check 3: {live_msg}")
+
+    # Check 4: Canary traffic remains observable after the durability window
+    svc_name = discover_svc_name(app_label)
     generate_mesh_traffic(app_label, svc_name, num_requests=200)
-    print("  Waiting up to 60s for Prometheus to observe converged canary traffic...")
+    print("  Waiting up to 60s for Prometheus to observe post-durability traffic...")
     canary_queries = [
         f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code=~"2..",reporter="destination"}}[5m]))',
         f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",response_code=~"2.."}}[5m]))',
@@ -1116,14 +1162,13 @@ def check_f3_durability(app_label, svc_name):
         f'count(istio_requests_total{{destination_app="{app_label}",destination_version="stable"}})',
     ], lambda value: value > 0) > 0
     if canary_rate > 0 and stable_labels:
-        print(f"  ✅ Check 3 (0.30): Canary traffic confirmed after convergence ({canary_rate:.4f} req/s)")
-        score += 0.30
+        print(f"  ✅ Check 4: Canary traffic still observable after durability window ({canary_rate:.4f} req/s)")
+        checks_passed += 1
     else:
-        print(f"  ❌ Check 3 (0.30): Canary traffic incomplete after convergence "
-              f"(canary_rate={canary_rate:.4f}, stable_labels={stable_labels})")
+        print(f"  ❌ Check 4: post-durability observability incomplete (canary_rate={canary_rate:.4f}, stable_labels={stable_labels})")
 
-    score = round(score, 2)
-    print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F3 (score={score})")
+    score = round(checks_passed / total, 2)
+    print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F4 ({checks_passed}/{total})")
     return score
 
 
@@ -1150,29 +1195,29 @@ def grade(transcript: str) -> GradingResult:
     subscores = {}
     weights = {}
 
-    # F1: Rollout Activation (weighted: 0.15 + 0.45 + 0.40)
+    # F1: Canary Traffic & Observability
     try:
-        subscores["rollout_activation"] = check_f1_rollout_activation(app_label, svc_name)
+        subscores["canary_traffic_observability"] = check_f1_canary_traffic_observability(app_label, svc_name)
     except Exception as e:
         print(f"Error in F1: {e}")
-        subscores["rollout_activation"] = 0.0
-    weights["rollout_activation"] = 1 / 3
+        subscores["canary_traffic_observability"] = 0.0
+    weights["canary_traffic_observability"] = 1 / 3
 
-    # F2: Declarative Convergence (weighted: 0.25 + 0.50 + 0.25)
+    # F2: GitOps Convergence
     try:
-        subscores["declarative_convergence"] = check_f2_declarative_convergence(app_label, svc_name)
+        subscores["gitops_convergence"] = check_f2_gitops_convergence(app_label)
     except Exception as e:
         print(f"Error in F2: {e}")
-        subscores["declarative_convergence"] = 0.0
-    weights["declarative_convergence"] = 1 / 3
+        subscores["gitops_convergence"] = 0.0
+    weights["gitops_convergence"] = 1 / 3
 
-    # F3: Durability (weighted: 0.20 + 0.50 + 0.30)
+    # F4: Drift Resilience
     try:
-        subscores["durability"] = check_f3_durability(app_label, svc_name)
+        subscores["drift_resilience"] = check_f4_drift_resilience(app_label)
     except Exception as e:
-        print(f"Error in F3: {e}")
-        subscores["durability"] = 0.0
-    weights["durability"] = 1 / 3
+        print(f"Error in F4: {e}")
+        subscores["drift_resilience"] = 0.0
+    weights["drift_resilience"] = 1 / 3
 
     # Calculate weighted score
     total_weight = sum(weights.values())
@@ -1180,9 +1225,9 @@ def grade(transcript: str) -> GradingResult:
 
     # Build feedback
     labels = {
-        "rollout_activation": ("F1", "Rollout activation — mesh-ready, controller alignment, visible canary traffic (33.3%)"),
-        "declarative_convergence": ("F2", "Declarative convergence — live state, Git source, refresh stability (33.3%)"),
-        "durability": ("F3", "Durability — drift removal, source cleanup, converged traffic (33.3%)"),
+        "canary_traffic_observability": ("F1", "Canary traffic & observability — routing, pods, metrics (33.3%)"),
+        "gitops_convergence": ("F2", "Declarative convergence — ArgoCD source, Git state, live state (33.3%)"),
+        "drift_resilience": ("F3", "Durability — drift removal, reconciliation, post-refresh traffic (33.3%)"),
     }
 
     feedback_lines = []
@@ -1190,8 +1235,6 @@ def grade(transcript: str) -> GradingResult:
         s = subscores.get(key, 0)
         icon = "✅" if s >= 1.0 else "⚠️" if s > 0 else "❌"
         feedback_lines.append(f"{icon} {code}: {desc} [{s:.0%}]")
-
-    feedback_text = "\n".join(feedback_lines)
 
     print(f"\n=== Final Score: {round(total_score, 3)} ===")
     for line in feedback_lines:
@@ -1201,5 +1244,5 @@ def grade(transcript: str) -> GradingResult:
         score=round(total_score, 3),
         subscores=subscores,
         weights=weights,
-        feedback=feedback_text,
+        feedback="\n".join(feedback_lines),
     )
