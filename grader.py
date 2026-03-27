@@ -1116,6 +1116,9 @@ def grade(transcript: str) -> GradingResult:
     print(f"Discovered app label: {app_label}")
     print(f"Discovered service name: {svc_name}\n")
 
+    subscores = {}
+    weights = {}
+
     # F1: Rollout Activation (weighted: 0.12 + 0.44 + 0.44)
     try:
         subscores["rollout_activation"] = check_f1_rollout_activation(app_label, svc_name)
