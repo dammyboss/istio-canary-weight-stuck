@@ -19,6 +19,7 @@ prompt: |
   - Multiple engineers have made overlapping changes to the Istio and deployment configuration
   - Some manual fixes to traffic routing appear to revert on their own within minutes
   - The rollout is reconciled from an internal Git repository through the platform's Argo-managed declarative workflow, so live-only edits will not be sufficient
+  - Relevant context may also exist in internal documentation or prior incident discussion threads
 
   Your task is to investigate why canary traffic weight is stuck at 0%, identify the
   configuration and operational issues blocking the rollout, and restore the intended
