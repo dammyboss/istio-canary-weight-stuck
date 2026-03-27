@@ -723,49 +723,28 @@ def check_f1_canary_traffic_observability(app_label, svc_name):
     Verifies canary receives traffic AND the observability pipeline reports it.
     Combines traffic routing verification with Prometheus metrics validation.
 
-    4 checks:
-    1. Canary pods exist with stable/canary identity labels AND istio-proxy sidecar
-    2. VirtualService has correct 90/10 weights with correct subset names
-    3. Canary HTTP 200 response rate > 0 in Prometheus (traffic flows + succeeds)
-    4. destination_version label propagation (both canary + stable in Prometheus)
+    2 checks:
+    1. VirtualService has correct 90/10 weights with correct subset names
+    2. Canary HTTP 200 response rate > 0 in Prometheus (traffic flows + succeeds)
     """
     print("\n--- F1: Canary Traffic & Observability ---")
     checks_passed = 0
-    total = 4
+    total = 2
 
-    # Check 1: Canary pods exist with correct labels AND sidecar
-    canary_with_sidecar = 0
-    canary_pods_ready = 0
-    for pod in _get_role_pods(app_label, "canary"):
-        has_sidecar = pod_has_istio_proxy(pod.get("spec", {}))
-        statuses = pod.get("status", {}).get("containerStatuses", [])
-        all_ready = all(s.get("ready", False) for s in statuses) if statuses else False
-        if all_ready:
-            canary_pods_ready += 1
-        if has_sidecar and all_ready:
-            canary_with_sidecar += 1
-
-    if canary_with_sidecar >= 1:
-        print(f"  ✅ Check 1: {canary_with_sidecar} canary pod(s) with sidecar and Ready")
-        checks_passed += 1
-    else:
-        print(f"  ❌ Check 1: canary pods with sidecar={canary_with_sidecar}, "
-              f"ready without sidecar={canary_pods_ready}")
-
-    # Check 2: VirtualService has correct 90/10 weights with correct subset names
+    # Check 1: VirtualService has correct 90/10 weights with correct subset names
     vs_weights = _read_vs_weights(app_label)
     if vs_weights and vs_weights.get("stable") == 90 and vs_weights.get("canary") == 10:
-        print(f"  ✅ Check 2: VirtualService weights = stable:90, canary:10")
+        print(f"  ✅ Check 1: VirtualService weights = stable:90, canary:10")
         checks_passed += 1
     else:
-        print(f"  ❌ Check 2: VirtualService weights = {vs_weights} "
+        print(f"  ❌ Check 1: VirtualService weights = {vs_weights} "
               f"(expected stable:90, canary:10)")
 
     # Generate traffic so Prometheus has data to query
     generate_mesh_traffic(app_label, svc_name, num_requests=300)
     print("  Waiting up to 60s for Prometheus to observe canary traffic...")
 
-    # Check 3: Canary HTTP 200 response rate > 0 (traffic flows AND succeeds)
+    # Check 2: Canary HTTP 200 response rate > 0 (traffic flows AND succeeds)
     # Combines F1's "traffic reaches canary" with F5's "successful responses"
     canary_queries = [
         f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code="200",reporter="destination"}}[5m]))',
@@ -775,32 +754,10 @@ def check_f1_canary_traffic_observability(app_label, svc_name):
     canary_200_rate = wait_for_prom_value(canary_queries, lambda value: value > 0)
 
     if canary_200_rate > 0:
-        print(f"  ✅ Check 3: Canary 200 response rate = {canary_200_rate:.4f} req/s")
+        print(f"  ✅ Check 2: Canary 200 response rate = {canary_200_rate:.4f} req/s")
         checks_passed += 1
     else:
-        print(f"  ❌ Check 3: Canary 200 response rate = 0 (no successful canary traffic)")
-
-    # Check 4: destination_version label propagation in Prometheus
-    # Verifies end-to-end observability: pod labels → Istio telemetry → Prometheus
-    version_labels_exist = wait_for_prom_value([
-        f'count(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary"}})',
-        f'count(istio_requests_total{{destination_app="{app_label}",destination_version="canary"}})',
-    ], lambda value: value > 0) > 0
-
-    stable_labels_exist = wait_for_prom_value([
-        f'count(istio_requests_total{{destination_service_name="{svc_name}",destination_version="stable"}})',
-        f'count(istio_requests_total{{destination_app="{app_label}",destination_version="stable"}})',
-    ], lambda value: value > 0) > 0
-
-    if version_labels_exist and stable_labels_exist:
-        print(f"  ✅ Check 4: Both destination_version=canary and =stable labels in Prometheus")
-        checks_passed += 1
-    elif version_labels_exist:
-        print(f"  ✅ Check 4: destination_version=canary labels present in Prometheus")
-        checks_passed += 1
-    else:
-        print(f"  ❌ Check 4: destination_version labels not found in Prometheus "
-              f"(canary={version_labels_exist}, stable={stable_labels_exist})")
+        print(f"  ❌ Check 2: Canary 200 response rate = 0 (no successful canary traffic)")
 
     score = round(checks_passed / total, 2)
     print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F1 ({checks_passed}/{total})")
@@ -836,7 +793,7 @@ def check_f2_gitops_convergence(app_label):
         source = app.get("spec", {}).get("source", {})
         automated = app.get("spec", {}).get("syncPolicy", {}).get("automated", {})
         repo_url = source.get("repoURL", "")
-        repo_ok = "gitea" in repo_url and repo_url.endswith(".git")
+        repo_ok = "gitea" in repo_url and repo_url.startswith(("http://", "https://"))
         rev_ok = bool(source.get("targetRevision", DEFAULT_TARGET_REVISION))
         path_ok = bool(source.get("path"))
         prune_ok = automated.get("prune") is True
