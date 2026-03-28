@@ -257,26 +257,22 @@ def _read_canary_deployment_state(app_label):
 
 
 def _selector_matches_role(selector, role):
-    """Accept either version-based or track-based stable/canary identity."""
+    """Require version-based stable/canary identity."""
     if not selector:
         return False
-    expected = selector.get("version") or selector.get("track")
-    return expected == role
+    return selector.get("version") == role
 
 
 def _deployment_matches_canary_role(labels):
-    """Accept either version=canary or track=canary on the canary deployment."""
+    """Require version=canary on the canary deployment."""
     if not labels:
         return False
-    return labels.get("version") == "canary" or labels.get("track") == "canary"
+    return labels.get("version") == "canary"
 
 
 def _get_role_pods(app_label, role):
-    """Return pods for a stable/canary role using either version or track labels."""
-    selectors = [
-        f"app={app_label},version={role}",
-        f"app={app_label},track={role}",
-    ]
+    """Return pods for a stable/canary role using version labels."""
+    selectors = [f"app={app_label},version={role}"]
     pods = []
     seen = set()
     for selector in selectors:
@@ -388,7 +384,7 @@ def _subsets_resolve_cleanly(app_label):
                 for pod in items:
                     pod_labels = pod.get("metadata", {}).get("labels", {})
                     pod_name = pod.get("metadata", {}).get("name", "")
-                    if pod_labels.get("track") == "canary" or pod_labels.get("version") == "canary" or "canary" in pod_name:
+                    if pod_labels.get("version") == "canary" or "canary" in pod_name:
                         canary_in_stable += 1
             except json.JSONDecodeError:
                 pass
@@ -483,7 +479,7 @@ def _find_mesh_pod(app_label):
                         pass
 
     # Fallback to bleat-service pods
-    for label_set in [f"app={app_label},version=stable", f"app={app_label},track=stable", f"app={app_label}"]:
+    for label_set in [f"app={app_label},version=stable", f"app={app_label}"]:
         pods_out, rc = run_kubectl(
             "get", "pods", "-l", label_set,
             "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}",
@@ -612,16 +608,12 @@ def _verify_git_repo_state(app_label, app):
                     if "weight: 90" in content and "weight: 10" in content and "subset: stable" in content and "subset: canary" in content:
                         results["vs_correct"] = True
                 if "DestinationRule" in content and "bleat-service" in content:
-                    if (
-                        ("version: canary" in content and "version: stable" in content) or
-                        ("track: canary" in content and "track: stable" in content)
-                    ):
+                    if "version: canary" in content and "version: stable" in content:
                         results["dr_correct"] = True
                 if "Deployment" in content:
                     canary_marker = (
                         ("canary" in lowered and f"app: {app_label}" in content) or
-                        "version: canary" in content or
-                        "track: canary" in content
+                        "version: canary" in content
                     )
                     inject_disabled = "sidecar.istio.io/inject: \"false\"" in lowered or "sidecar.istio.io/inject: false" in lowered
                     if canary_marker and not inject_disabled:
@@ -728,14 +720,14 @@ def check_f1_canary_traffic_observability(app_label, svc_name):
     2. Canary HTTP 200 response rate > 0 in Prometheus (traffic flows + succeeds)
     """
     print("\n--- F1: Canary Traffic & Observability ---")
-    checks_passed = 0
-    total = 2
+    score = 0.0
+    weights = {"c1": 0.20, "c2": 0.80}
 
     # Check 1: VirtualService has correct 90/10 weights with correct subset names
     vs_weights = _read_vs_weights(app_label)
     if vs_weights and vs_weights.get("stable") == 90 and vs_weights.get("canary") == 10:
         print(f"  ✅ Check 1: VirtualService weights = stable:90, canary:10")
-        checks_passed += 1
+        score += weights["c1"]
     else:
         print(f"  ❌ Check 1: VirtualService weights = {vs_weights} "
               f"(expected stable:90, canary:10)")
@@ -755,12 +747,12 @@ def check_f1_canary_traffic_observability(app_label, svc_name):
 
     if canary_200_rate > 0:
         print(f"  ✅ Check 2: Canary 200 response rate = {canary_200_rate:.4f} req/s")
-        checks_passed += 1
+        score += weights["c2"]
     else:
         print(f"  ❌ Check 2: Canary 200 response rate = 0 (no successful canary traffic)")
 
-    score = round(checks_passed / total, 2)
-    print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F1 ({checks_passed}/{total})")
+    score = round(score, 2)
+    print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F1 ({score:.2f}/1.00)")
     return score
 
 
@@ -783,8 +775,8 @@ def check_f2_gitops_convergence(app_label):
     4. State survives a hard refresh and remains Synced
     """
     print("\n--- F2: GitOps Convergence ---")
-    checks_passed = 0
-    total = 4
+    score = 0.0
+    weights = {"c1": 0.35, "c2": 0.35, "c3": 0.10, "c4": 0.20}
 
     # Check 1: ArgoCD app source and policy must match the intended declarative state
     app = _read_argocd_application(app_label)
@@ -804,7 +796,7 @@ def check_f2_gitops_convergence(app_label):
                 f"(app={app.get('metadata', {}).get('name')}, repo={source.get('repoURL')}, rev={source.get('targetRevision')}, "
                 f"path={source.get('path')}, prune={prune_ok}, selfHeal={self_heal_ok}, status={sync_status})"
             )
-            checks_passed += 1
+            score += weights["c1"]
         else:
             print(
                 f"  ❌ Check 1: repo_ok={repo_ok}, rev_ok={rev_ok}, path_ok={path_ok}, "
@@ -819,7 +811,7 @@ def check_f2_gitops_convergence(app_label):
               git_state["dr_correct"] and git_state.get("canary_deploy_in_git", False))
     if git_ok:
         print(f"  ✅ Check 2: Git repo has correct VS/DR/canary-deploy and no saboteur references")
-        checks_passed += 1
+        score += weights["c2"]
     else:
         details = []
         if not git_state["vs_correct"]:
@@ -838,7 +830,7 @@ def check_f2_gitops_convergence(app_label):
     subsets_ok, subsets_msg = _subsets_resolve_cleanly(app_label)
     if live_ok and not fault_filter_present and subsets_ok:
         print(f"  ✅ Check 3: {live_msg}; {subsets_msg}; no fault-injection EnvoyFilter remains")
-        checks_passed += 1
+        score += weights["c3"]
     else:
         issues = []
         if not live_ok:
@@ -869,7 +861,7 @@ def check_f2_gitops_convergence(app_label):
             )
             if refreshed_sync in ("Synced", "OutOfSync") and refreshed_ok:
                 print(f"  ✅ Check 4: Hard refresh preserved synced declarative state")
-                checks_passed += 1
+                score += weights["c4"]
             else:
                 print(f"  ❌ Check 4: status={refreshed_sync}, live_state={refreshed_msg}")
         else:
@@ -877,8 +869,8 @@ def check_f2_gitops_convergence(app_label):
     else:
         print("  ❌ Check 4: Skipped (Check 3 failed)")
 
-    score = round(checks_passed / total, 2)
-    print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F2 ({checks_passed}/{total})")
+    score = round(score, 2)
+    print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F2 ({score:.2f}/1.00)")
     return score
 
 
@@ -977,7 +969,7 @@ def check_f3_service_mesh_integrity(app_label):
                 for pod in items:
                     pod_labels = pod.get("metadata", {}).get("labels", {})
                     pod_name = pod.get("metadata", {}).get("name", "")
-                    if pod_labels.get("track") == "canary" or "canary" in pod_name:
+                    if pod_labels.get("version") == "canary" or "canary" in pod_name:
                         canary_in_stable += 1
             except json.JSONDecodeError:
                 pass
@@ -1027,8 +1019,8 @@ def check_f4_drift_resilience(app_label):
     4. Canary traffic and observability still work after the durability window
     """
     print("\n--- F4: Drift Resilience ---")
-    checks_passed = 0
-    total = 4
+    score = 0.0
+    weights = {"c1": 0.35, "c2": 0.35, "c3": 0.15, "c4": 0.15}
 
     # Check 1: No active drift mutators remain, and declarative sync policy is enforced
     suspicious_resources = []
@@ -1057,7 +1049,7 @@ def check_f4_drift_resilience(app_label):
 
     if not suspicious_resources and prune_enabled and self_heal_enabled:
         print(f"  ✅ Check 1: No drift enforcers, ArgoCD prune+selfHeal enabled")
-        checks_passed += 1
+        score += weights["c1"]
     elif not suspicious_resources and (not prune_enabled or not self_heal_enabled):
         print(f"  ❌ Check 1: No drift enforcers found but ArgoCD prune={prune_enabled}, "
               f"selfHeal={self_heal_enabled} (not declaratively enforced)")
@@ -1088,7 +1080,7 @@ def check_f4_drift_resilience(app_label):
     git_state = _verify_git_repo_state(app_label, app)
     if not suspicious_jobs and git_state["no_saboteurs"]:
         print("  ✅ Check 2: No active drift Jobs/hooks and Git source no longer contains saboteurs")
-        checks_passed += 1
+        score += weights["c2"]
     else:
         if suspicious_jobs:
             print("  ❌ Check 2: Drift enforcer Jobs found:")
@@ -1101,7 +1093,7 @@ def check_f4_drift_resilience(app_label):
     live_ok, live_msg = _live_gitops_state_ok(app_label)
     if live_ok:
         print(f"  ✅ Check 3: {live_msg}")
-        checks_passed += 1
+        score += weights["c3"]
     else:
         print(f"  ❌ Check 3: {live_msg}")
 
@@ -1120,12 +1112,12 @@ def check_f4_drift_resilience(app_label):
     ], lambda value: value > 0) > 0
     if canary_rate > 0 and stable_labels:
         print(f"  ✅ Check 4: Canary traffic still observable after durability window ({canary_rate:.4f} req/s)")
-        checks_passed += 1
+        score += weights["c4"]
     else:
         print(f"  ❌ Check 4: post-durability observability incomplete (canary_rate={canary_rate:.4f}, stable_labels={stable_labels})")
 
-    score = round(checks_passed / total, 2)
-    print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F4 ({checks_passed}/{total})")
+    score = round(score, 2)
+    print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F4 ({score:.2f}/1.00)")
     return score
 
 

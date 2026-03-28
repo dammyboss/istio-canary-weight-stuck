@@ -27,6 +27,7 @@ prompt: |
 
   Ensure:
   - Traffic is restored to the intended initial canary split and is verifiable via platform telemetry
+  - The restored split is observable through Istio's standard telemetry pipeline
   - The service mesh is correctly configured for both stable and canary subsets
   - All fixes are durable and survive reconciliation or refresh activity from the platform's declarative source of truth
   - The final state is declarative rather than a temporary imperative patch applied only to the live cluster
