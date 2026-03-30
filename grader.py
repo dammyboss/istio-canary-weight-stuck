@@ -718,7 +718,7 @@ def check_f1_canary_traffic_observability(app_label, svc_name):
     """
     print("\n--- F1: Canary Traffic & Observability ---")
     score = 0.0
-    weights = {"c1": 0.35, "c2": 0.65}
+    weights = {"c1": 0.25, "c2": 0.75}
 
     # Check 1: VS weights correct AND canary traffic visible (both must pass)
     vs_weights = _read_vs_weights(app_label)
