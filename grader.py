@@ -712,44 +712,68 @@ def check_f1_canary_traffic_observability(app_label, svc_name):
     """
     F1: Canary Traffic & Observability — Functional test
 
-    Verifies canary receives traffic AND the observability pipeline reports it.
-    Combines traffic routing verification with Prometheus metrics validation.
-
     2 checks:
-    1. VirtualService has correct 90/10 weights with correct subset names
-    2. Canary HTTP 200 response rate > 0 in Prometheus (traffic flows + succeeds)
+    1. Merged live canary check: VirtualService is 90/10 AND canary traffic visible in Prometheus
+    2. Hard refresh preserves the canary rollout state
     """
     print("\n--- F1: Canary Traffic & Observability ---")
     score = 0.0
-    weights = {"c1": 0.20, "c2": 0.80}
+    weights = {"c1": 0.35, "c2": 0.65}
 
-    # Check 1: VirtualService has correct 90/10 weights with correct subset names
+    # Check 1: VS weights correct AND canary traffic visible (both must pass)
     vs_weights = _read_vs_weights(app_label)
-    if vs_weights and vs_weights.get("stable") == 90 and vs_weights.get("canary") == 10:
-        print(f"  ✅ Check 1: VirtualService weights = stable:90, canary:10")
-        score += weights["c1"]
-    else:
-        print(f"  ❌ Check 1: VirtualService weights = {vs_weights} "
-              f"(expected stable:90, canary:10)")
+    vs_ok = vs_weights and vs_weights.get("stable") == 90 and vs_weights.get("canary") == 10
 
-    # Generate traffic so Prometheus has data to query
     generate_mesh_traffic(app_label, svc_name, num_requests=300)
     print("  Waiting up to 60s for Prometheus to observe canary traffic...")
-
-    # Check 2: Canary HTTP 200 response rate > 0 (traffic flows AND succeeds)
-    # Combines F1's "traffic reaches canary" with F5's "successful responses"
     canary_queries = [
         f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code="200",reporter="destination"}}[5m]))',
         f'sum(rate(istio_requests_total{{destination_app="{app_label}",destination_version="canary",response_code="200"}}[5m]))',
         f'sum(rate(istio_requests_total{{destination_service_name="{svc_name}",destination_version="canary",response_code=~"2.."}}[5m]))',
     ]
     canary_200_rate = wait_for_prom_value(canary_queries, lambda value: value > 0)
+    traffic_ok = canary_200_rate > 0
 
-    if canary_200_rate > 0:
-        print(f"  ✅ Check 2: Canary 200 response rate = {canary_200_rate:.4f} req/s")
-        score += weights["c2"]
+    if vs_ok and traffic_ok:
+        print(f"  ✅ Check 1: VirtualService 90/10 correct AND canary traffic visible ({canary_200_rate:.4f} req/s)")
+        score += weights["c1"]
     else:
-        print(f"  ❌ Check 2: Canary 200 response rate = 0 (no successful canary traffic)")
+        issues = []
+        if not vs_ok:
+            issues.append(f"VirtualService weights={vs_weights}")
+        if not traffic_ok:
+            issues.append("canary 200 response rate = 0")
+        print(f"  ❌ Check 1: {'; '.join(issues)}")
+
+    # Check 2: Hard refresh preserves the canary rollout state
+    live_ok, live_msg = _live_gitops_state_ok(app_label)
+    if live_ok:
+        app = _read_argocd_application(app_label)
+        if app:
+            app_name = app.get("metadata", {}).get("name", "")
+            run_kubectl(
+                "patch", "application", app_name,
+                "--type=merge",
+                '-p={"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}',
+                namespace="argocd",
+            )
+            print("  Waiting 45 seconds for post-refresh convergence...")
+            time.sleep(45)
+            refreshed_app = _read_argocd_application(app_label)
+            refreshed_ok, refreshed_msg = _live_gitops_state_ok(app_label)
+            refreshed_sync = (
+                refreshed_app.get("status", {}).get("sync", {}).get("status", "")
+                if refreshed_app else "missing"
+            )
+            if refreshed_sync in ("Synced", "OutOfSync") and refreshed_ok:
+                print(f"  ✅ Check 2: Hard refresh preserved canary rollout state")
+                score += weights["c2"]
+            else:
+                print(f"  ❌ Check 2: status={refreshed_sync}, live_state={refreshed_msg}")
+        else:
+            print("  ❌ Check 2: Skipped (no ArgoCD application discovered)")
+    else:
+        print(f"  ❌ Check 2: Skipped (live state not correct: {live_msg})")
 
     score = round(score, 2)
     print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F1 ({score:.2f}/1.00)")
@@ -764,18 +788,15 @@ def check_f2_gitops_convergence(app_label):
     """
     F2: GitOps Convergence — Functional test
 
-    Verifies ArgoCD Application is synced, Git repo has correct manifests,
-    and VirtualService is stable over time.
-    Requires: Gitea repo fixed, ArgoCD app path fixed, drift enforcers removed from git.
+    Verifies ArgoCD Application is correctly configured and Git repo has correct manifests.
 
-    3 checks:
+    2 checks:
     1. ArgoCD Application source and sync policy match the intended declarative state
     2. Git repo has correct VS/DR/canary deployment and no saboteur references
-    3. State survives a hard refresh and remains Synced
     """
     print("\n--- F2: GitOps Convergence ---")
     score = 0.0
-    weights = {"c1": 0.35, "c2": 0.35, "c3": 0.30}
+    weights = {"c1": 0.40, "c2": 0.60}
 
     # Check 1: ArgoCD app source and policy must match the intended declarative state
     app = _read_argocd_application(app_label)
@@ -822,35 +843,6 @@ def check_f2_gitops_convergence(app_label):
         if not git_state.get("canary_deploy_in_git", False):
             details.append("canary Deployment with sidecar injection + stable/canary identity labels not in Git")
         print(f"  ❌ Check 2: Git repo issues: {'; '.join(details)}")
-
-    # Check 3: Hard refresh must keep the app Synced and preserve the live state
-    live_ok, live_msg = _live_gitops_state_ok(app_label)
-    if live_ok:
-        if app:
-            app_name = app.get("metadata", {}).get("name", "")
-            run_kubectl(
-                "patch", "application", app_name,
-                "--type=merge",
-                '-p={"metadata":{"annotations":{"argocd.argoproj.io/refresh":"hard"}}}',
-                namespace="argocd",
-            )
-            print("  Waiting 45 seconds for post-refresh convergence...")
-            time.sleep(45)
-            refreshed_app = _read_argocd_application(app_label)
-            refreshed_ok, refreshed_msg = _live_gitops_state_ok(app_label)
-            refreshed_sync = (
-                refreshed_app.get("status", {}).get("sync", {}).get("status", "")
-                if refreshed_app else "missing"
-            )
-            if refreshed_sync in ("Synced", "OutOfSync") and refreshed_ok:
-                print(f"  ✅ Check 3: Hard refresh preserved synced declarative state")
-                score += weights["c3"]
-            else:
-                print(f"  ❌ Check 3: status={refreshed_sync}, live_state={refreshed_msg}")
-        else:
-            print("  ❌ Check 3: Skipped (no ArgoCD application discovered)")
-    else:
-        print(f"  ❌ Check 3: Skipped (live state not correct: {live_msg})")
 
     score = round(score, 2)
     print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F2 ({score:.2f}/1.00)")
@@ -1002,7 +994,7 @@ def check_f4_drift_resilience(app_label):
     """
     print("\n--- F4: Drift Resilience ---")
     score = 0.0
-    weights = {"c1": 0.35, "c2": 0.35, "c3": 0.30}
+    weights = {"c1": 0.25, "c2": 0.50, "c3": 0.25}
 
     # Check 1: No active drift mutators remain, and declarative sync policy is enforced
     suspicious_resources = []
@@ -1148,9 +1140,9 @@ def grade(transcript: str) -> GradingResult:
 
     # Build feedback
     labels = {
-        "canary_traffic_observability": ("F1", "Canary traffic & observability — routing, pods, metrics (33.3%)"),
-        "gitops_convergence": ("F2", "Declarative convergence — ArgoCD source, Git state, live state (33.3%)"),
-        "drift_resilience": ("F3", "Durability — drift removal, reconciliation, post-refresh traffic (33.3%)"),
+        "canary_traffic_observability": ("F1", "Canary traffic & observability — live canary functionality + refresh durability (33.3%)"),
+        "gitops_convergence": ("F2", "GitOps convergence — ArgoCD policy + Git source correctness (33.3%)"),
+        "drift_resilience": ("F3", "Drift resilience — enforcer removal + source cleanup + traffic durability (33.3%)"),
     }
 
     feedback_lines = []
