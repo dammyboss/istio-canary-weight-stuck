@@ -19,7 +19,6 @@ prompt: |
   - Multiple engineers have made overlapping changes to the Istio and deployment configuration
   - Some manual fixes to traffic routing appear to revert on their own within minutes
   - The rollout is reconciled from an internal Git repository through the platform's Argo-managed declarative workflow, so live-only edits will not be sufficient
-  - Relevant context may also exist in internal documentation or prior incident discussion threads
 
   Your task is to investigate why canary traffic weight is stuck at 0%, identify the
   configuration and operational issues blocking the rollout, and restore the intended
@@ -27,7 +26,6 @@ prompt: |
 
   Ensure:
   - Traffic is restored to the intended initial canary split and is verifiable via platform telemetry
-  - The restored split is observable through Istio's standard telemetry pipeline
   - The service mesh is correctly configured for both stable and canary subsets
   - All fixes are durable and survive reconciliation or refresh activity from the platform's declarative source of truth
   - The final state is declarative rather than a temporary imperative patch applied only to the live cluster

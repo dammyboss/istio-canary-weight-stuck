@@ -1753,15 +1753,17 @@ periodically reviews rollout behavior during staged releases.
 
 ### Troubleshooting: Canary Not Receiving Traffic
 
-Rollout baseline note:
-Bleater rollouts keep the initial canary gate conservative until the
-canary request series is visible in platform telemetry. Do not widen the
-canary percentage before the telemetry path is healthy.
-
 **Step 1**: Check the VirtualService weights
 ```bash
 kubectl get virtualservice bleat-service -n bleater -o yaml
 ```
+If weights are wrong, patch them directly:
+```bash
+kubectl patch virtualservice bleat-service -n bleater --type=json \
+  -p='[{"op":"replace","path":"/spec/http/0/route/1/weight","value":10},
+       {"op":"replace","path":"/spec/http/0/route/0/weight","value":90}]'
+```
+
 **Step 2**: Verify DestinationRule subsets exist
 ```bash
 kubectl get destinationrule bleat-service -n bleater -o yaml
@@ -1777,10 +1779,6 @@ their labels and sidecar annotations still align with the active subset model.
   ConfigMap in the bleater namespace for more details.
 - If patches keep reverting, compare the running objects with the
   declarative sources that own them before continuing with manual changes.
-- Runtime bundles that own rollout resources are expected to keep Argo
-  automated sync with both `selfHeal` and `prune` enabled. Without both,
-  stale hook objects and removed rollout resources can survive refreshes
-  even after the source repo is fixed.
 WIKICONTENT
 )
 
@@ -1902,11 +1900,9 @@ except: print('')
                 ":rotating_light: **PLAT-4521: Canary traffic stuck at 0%** — bleat-service canary pods are Ready but receiving zero requests. Prometheus shows flatlined CPU/memory on canary pods. Investigating..." \
                 "Tried setting PeerAuthentication to PERMISSIVE mode for the bleater namespace — didn't help. The canary pods still show no incoming connections in the Envoy access logs. Maybe it's not an mTLS issue?" \
                 "I think the canary image itself might be broken — when I curl the canary pod directly, I'm getting 503 errors with 'upstream connect error'. Could be a bad build?" \
-                "I manually patched the VirtualService weights back to the rollout baseline, but the canary still looked dead in metrics. That makes me think the weight alone isn't the only problem." \
-                "Reminder from the rollout standards doc: the initial bleat-service gate stays conservative until the canary request series is visible in telemetry. We should not widen it early." \
+                "I manually patched the VirtualService weights to 90/10, but the canary still looked dead in metrics. That makes me think the weight alone isn't the only problem." \
                 "Checked the HPA for canary — the bleater-canary-autoscaler has minReplicas: 0. That might be why the canary keeps getting scaled down during off-peak. Let me try setting it to 1." \
                 "The pod templates and the routing subsets may be out of sync. Before we touch more traffic config, we should compare what the mesh is matching against the labels actually present on the workloads." \
-                "If runtime-bundle is still owning these resources, make sure automated sync is configured strongly enough to clean up stale rollout artifacts and reverse live drift." \
                 "I swear I cleaned up everything that was messing with the config, but no luck. Extended investigation might be needed."; do
                 curl -sf -X POST -H "Authorization: Bearer ${MM_TOKEN}" \
                     -H "Content-Type: application/json" \
