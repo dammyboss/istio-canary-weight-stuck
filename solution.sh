@@ -328,13 +328,12 @@ metadata:
   labels:
     app: ${STABLE_APP_LABEL}
     role: canary-release
-    track: canary
 spec:
   replicas: 2
   selector:
     matchLabels:
       app: ${STABLE_APP_LABEL}
-      track: canary
+      version: canary
   template:
     metadata:
       annotations:
@@ -343,7 +342,6 @@ spec:
         sidecar.istio.io/inject: "true"
       labels:
         app: ${STABLE_APP_LABEL}
-        track: canary
         version: canary
     spec:
       containers:
@@ -356,8 +354,6 @@ spec:
         env:
         - name: CANARY_VERSION
           value: "v2.1.0"
-        - name: DEPLOYMENT_TRACK
-          value: "canary"
         resources:
           requests:
             cpu: 50m
