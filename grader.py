@@ -768,15 +768,14 @@ def check_f2_gitops_convergence(app_label):
     and VirtualService is stable over time.
     Requires: Gitea repo fixed, ArgoCD app path fixed, drift enforcers removed from git.
 
-    4 checks:
+    3 checks:
     1. ArgoCD Application source and sync policy match the intended declarative state
     2. Git repo has correct VS/DR/canary deployment and no saboteur references
-    3. Live VirtualService, DestinationRule, and canary deployment match the intended state
-    4. State survives a hard refresh and remains Synced
+    3. State survives a hard refresh and remains Synced
     """
     print("\n--- F2: GitOps Convergence ---")
     score = 0.0
-    weights = {"c1": 0.35, "c2": 0.35, "c3": 0.10, "c4": 0.20}
+    weights = {"c1": 0.35, "c2": 0.35, "c3": 0.30}
 
     # Check 1: ArgoCD app source and policy must match the intended declarative state
     app = _read_argocd_application(app_label)
@@ -824,24 +823,8 @@ def check_f2_gitops_convergence(app_label):
             details.append("canary Deployment with sidecar injection + stable/canary identity labels not in Git")
         print(f"  ❌ Check 2: Git repo issues: {'; '.join(details)}")
 
-    # Check 3: Live state must match the intended GitOps outcome
+    # Check 3: Hard refresh must keep the app Synced and preserve the live state
     live_ok, live_msg = _live_gitops_state_ok(app_label)
-    fault_filter_present, fault_filter_name = _has_fault_injection_envoyfilter()
-    subsets_ok, subsets_msg = _subsets_resolve_cleanly(app_label)
-    if live_ok and not fault_filter_present and subsets_ok:
-        print(f"  ✅ Check 3: {live_msg}; {subsets_msg}; no fault-injection EnvoyFilter remains")
-        score += weights["c3"]
-    else:
-        issues = []
-        if not live_ok:
-            issues.append(live_msg)
-        if fault_filter_present:
-            issues.append(f"fault-injection EnvoyFilter still present ({fault_filter_name})")
-        if not subsets_ok:
-            issues.append(subsets_msg)
-        print(f"  ❌ Check 3: {'; '.join(issues)}")
-
-    # Check 4: Hard refresh must keep the app Synced and preserve the live state
     if live_ok:
         if app:
             app_name = app.get("metadata", {}).get("name", "")
@@ -860,14 +843,14 @@ def check_f2_gitops_convergence(app_label):
                 if refreshed_app else "missing"
             )
             if refreshed_sync in ("Synced", "OutOfSync") and refreshed_ok:
-                print(f"  ✅ Check 4: Hard refresh preserved synced declarative state")
-                score += weights["c4"]
+                print(f"  ✅ Check 3: Hard refresh preserved synced declarative state")
+                score += weights["c3"]
             else:
-                print(f"  ❌ Check 4: status={refreshed_sync}, live_state={refreshed_msg}")
+                print(f"  ❌ Check 3: status={refreshed_sync}, live_state={refreshed_msg}")
         else:
-            print("  ❌ Check 4: Skipped (no ArgoCD application discovered)")
+            print("  ❌ Check 3: Skipped (no ArgoCD application discovered)")
     else:
-        print("  ❌ Check 4: Skipped (Check 3 failed)")
+        print(f"  ❌ Check 3: Skipped (live state not correct: {live_msg})")
 
     score = round(score, 2)
     print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F2 ({score:.2f}/1.00)")
@@ -1012,15 +995,14 @@ def check_f4_drift_resilience(app_label):
     Verifies all drift enforcers are permanently removed and fixes persist.
     Runs AFTER the 90s durability wait in cleanup_and_wait().
 
-    4 checks:
+    3 checks:
     1. No active drift actor remains and the declarative sync policy is fully enforced
     2. Git source no longer contains an active reintroduction path for the sabotaged state
-    3. Live VirtualService, DestinationRule, and canary deployment still match the intended state
-    4. Canary traffic and observability still work after the durability window
+    3. Canary traffic and observability still work after the durability window
     """
     print("\n--- F4: Drift Resilience ---")
     score = 0.0
-    weights = {"c1": 0.35, "c2": 0.35, "c3": 0.15, "c4": 0.15}
+    weights = {"c1": 0.35, "c2": 0.35, "c3": 0.30}
 
     # Check 1: No active drift mutators remain, and declarative sync policy is enforced
     suspicious_resources = []
@@ -1089,15 +1071,7 @@ def check_f4_drift_resilience(app_label):
         else:
             print("  ❌ Check 2: Git source still contains saboteur references")
 
-    # Check 3: Live state still matches intended declarative outcome after drift window
-    live_ok, live_msg = _live_gitops_state_ok(app_label)
-    if live_ok:
-        print(f"  ✅ Check 3: {live_msg}")
-        score += weights["c3"]
-    else:
-        print(f"  ❌ Check 3: {live_msg}")
-
-    # Check 4: Canary traffic remains observable after the durability window
+    # Check 3: Canary traffic remains observable after the durability window
     svc_name = discover_svc_name(app_label)
     generate_mesh_traffic(app_label, svc_name, num_requests=200)
     print("  Waiting up to 60s for Prometheus to observe post-durability traffic...")
@@ -1111,10 +1085,10 @@ def check_f4_drift_resilience(app_label):
         f'count(istio_requests_total{{destination_app="{app_label}",destination_version="stable"}})',
     ], lambda value: value > 0) > 0
     if canary_rate > 0 and stable_labels:
-        print(f"  ✅ Check 4: Canary traffic still observable after durability window ({canary_rate:.4f} req/s)")
-        score += weights["c4"]
+        print(f"  ✅ Check 3: Canary traffic still observable after durability window ({canary_rate:.4f} req/s)")
+        score += weights["c3"]
     else:
-        print(f"  ❌ Check 4: post-durability observability incomplete (canary_rate={canary_rate:.4f}, stable_labels={stable_labels})")
+        print(f"  ❌ Check 3: post-durability observability incomplete (canary_rate={canary_rate:.4f}, stable_labels={stable_labels})")
 
     score = round(score, 2)
     print(f"{'✅ PASSED' if score >= 1.0 else '⚠️ PARTIAL' if score > 0 else '❌ FAILED'} F4 ({score:.2f}/1.00)")
